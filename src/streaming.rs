@@ -165,6 +165,7 @@ pub async fn stream_handler(
                 None,
                 Some("streaming".to_string()),
                 is_byok,
+                false, // streaming never serves from the semantic cache
             );
         } else {
             // FIX: audit_tx was dropped without ever sending — the stream
@@ -190,11 +191,15 @@ pub async fn stream_handler(
         }
         Provider::Gemini => {
             let body = to_gemini_body(&req);
+            // FIX: key moved out of the URL and into the x-goog-api-key
+            // header below (see connectors.rs's GeminiConnector for the
+            // matching non-streaming fix and the full rationale) — a
+            // secret embedded in a URL is far more exposure-prone than
+            // one carried in a header.
             let url = format!(
-                "{}/{}:streamGenerateContent?alt=sse&key={}",
+                "{}/{}:streamGenerateContent?alt=sse",
                 provider_base_url(Provider::Gemini),
-                req.model,
-                api_key
+                req.model
             );
             (url, body)
         }
@@ -209,7 +214,11 @@ pub async fn stream_handler(
     let is_anthropic = matches!(provider, Provider::Anthropic);
 
     let http_req = if is_gemini {
-        http_client.post(&url).header("content-type", "application/json").json(&body)
+        http_client
+            .post(&url)
+            .header("x-goog-api-key", &api_key)
+            .header("content-type", "application/json")
+            .json(&body)
     } else if is_anthropic {
         http_client
             .post(&url)
