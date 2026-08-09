@@ -482,6 +482,56 @@ async fn handle_non_streaming(
             let cached_response: ChatCompletionResponse = serde_json::from_str(&hit.cached_response)
                 .map_err(|e| ApiError::InternalError(format!("Failed to parse cache: {}", e)))?;
 
+            // FIX: this used to `return` here without ever touching
+            // cost_tracker — no row was ever written to request_logs for a
+            // cache hit, and write_request_log's INSERT didn't even
+            // include `from_cache`, so the column was always FALSE for
+            // every row that *did* get written. Net effect: admin.rs's
+            // cache_hit_rate_pct/cache_hits/estimated_saved_usd were
+            // structurally 0 forever, regardless of real cache traffic.
+            // Now records a real (zero-cost, from_cache=true) row so the
+            // dashboard reflects reality — a cache hit shows 100% savings
+            // vs. the same GPT-4o baseline used on the normal path, since
+            // no provider was actually billed.
+            let cache_hit_latency_ms = start.elapsed().as_millis() as u64;
+            let input_tokens = tokens::count_request_tokens(&request.messages, &request.model)
+                .unwrap_or(0);
+            let output_tokens = cached_response
+                .choices
+                .first()
+                .map(|c| tokens::count_tokens(&c.message.content.as_text()).unwrap_or(0))
+                .unwrap_or(0);
+
+            let token_cost = TokenCostBreakdown::new(input_tokens, output_tokens, 0.0, 0.0);
+            let baseline_cost = TokenCostBreakdown::new(input_tokens, output_tokens, 500.0, 3000.0);
+
+            // The cached response's own `model` field is the real model
+            // that originally generated it (set from the live provider
+            // call at store()-time) — resolve a provider from that for
+            // reporting purposes. Falls back to OpenRouter (the system's
+            // existing universal-fallback provider) if that model has
+            // since been removed from the registry, so a lookup failure
+            // here never blocks serving the cached response.
+            let cache_hit_provider = state
+                .route_engine
+                .select_provider(&cached_response.model)
+                .unwrap_or(Provider::OpenRouter);
+
+            state.cost_tracker.record_request(
+                request_id.clone(),
+                cache_hit_provider,
+                cached_response.model.clone(),
+                &token_cost,
+                baseline_cost.total_cost_cents,
+                cache_hit_latency_ms,
+                0,
+                client_id,
+                None,
+                None,
+                true,
+                true, // from_cache
+            );
+
             return Ok(Json(cached_response));
         }
     }
@@ -716,6 +766,7 @@ async fn handle_non_streaming(
         None,
         None,
         true,
+        false, // this is the real-provider-call path, not a cache hit
     );
 
     let total_latency = start.elapsed().as_millis() as u64;
