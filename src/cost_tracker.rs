@@ -196,7 +196,21 @@ impl CostTracker {
         });
     }
 
-    /// Record a request asynchronously to the database
+    /// Record a request asynchronously to the database.
+    ///
+    /// FIX: added `from_cache`. Previously this was called only from the
+    /// non-cache-hit path in main.rs — a semantic-cache hit returned the
+    /// cached response before ever reaching record_request, so no row was
+    /// ever written for it, and write_request_log's INSERT didn't even
+    /// include the `from_cache` column (it silently took the schema's
+    /// DEFAULT FALSE). Net effect: `request_logs.from_cache` was `FALSE`
+    /// for every row, always — admin.rs's cache_hit_rate_pct/cache_hits/
+    /// estimated_saved_usd were structurally 0 forever regardless of how
+    /// much the semantic cache was actually being hit (semantic_cache's
+    /// own `hit_count` column was fine; it's the audit-log/dashboard side
+    /// that was blind to it). Callers must now pass `from_cache` and
+    /// main.rs's cache-hit path must call this instead of returning early
+    /// without doing so.
     #[instrument(skip(self), fields(request_id = %request_id))]
     #[allow(clippy::too_many_arguments)]
     pub fn record_request(
@@ -212,12 +226,14 @@ impl CostTracker {
         user_tier: Option<String>,
         priority: Option<String>,
         is_byok: bool,
+        from_cache: bool,
     ) {
         // Log BEFORE variables get moved into tokio::spawn
         debug!(
             request_id = %request_id,
             cost_cents = token_cost.total_cost_cents,
             is_byok = is_byok,
+            from_cache = from_cache,
             "Queued request log for database write"
         );
 
@@ -240,6 +256,7 @@ impl CostTracker {
                 user_tier,
                 priority,
                 is_byok,
+                from_cache,
             )
             .await
             {
@@ -308,6 +325,12 @@ impl CostTracker {
     }
 
     /// Internal: Write request log to database
+    ///
+    /// FIX: added `from_cache` to both the signature and the INSERT's
+    /// column list — previously this column was never mentioned here at
+    /// all, so every row silently took the schema's DEFAULT FALSE
+    /// (migrations/002_semantic_cache_and_vision.sql). See the FIX note on
+    /// record_request above for the full explanation.
     #[allow(clippy::too_many_arguments)]
     async fn write_request_log(
         pool: Arc<PgPool>,
@@ -322,6 +345,7 @@ impl CostTracker {
         user_tier: Option<String>,
         priority: Option<String>,
         is_byok: bool,
+        from_cache: bool,
     ) -> Result<(), CostTrackerError> {
         let cost_saved = baseline_cost_cents - token_cost.total_cost_cents;
 
@@ -333,10 +357,10 @@ impl CostTracker {
                 cost_cents, cost_saved_cents,
                 latency_ms, routing_decision_ms,
                 client_id, user_tier, priority,
-                is_byok,
+                is_byok, from_cache,
                 status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'success')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'success')
             "#,
         )
         .bind(&request_id)
@@ -352,12 +376,14 @@ impl CostTracker {
         .bind(&user_tier)
         .bind(&priority)
         .bind(is_byok)
+        .bind(from_cache)
         .execute(pool.as_ref())
         .await?;
 
         debug!(
             request_id = %request_id,
             is_byok = is_byok,
+            from_cache = from_cache,
             "Request log written to database"
         );
 
