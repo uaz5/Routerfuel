@@ -600,10 +600,19 @@ impl Connector for GeminiConnector {
             req.model
         );
 
+        // FIX: was `.query(&[("key", client_api_key)])`, which puts the
+        // client's BYOK Gemini key directly in the request URL. Google's
+        // Generative Language API accepts the key either way, but a
+        // secret in a URL is far more likely to end up somewhere it
+        // shouldn't — proxy/load-balancer access logs, APM/tracing tools
+        // that capture the outbound request line, etc. Every other
+        // connector in this file sends its key via a header
+        // (Authorization: Bearer / x-api-key); Gemini now does too, via
+        // Google's documented x-goog-api-key header.
         let http_resp = self
             .client
             .post(&url)
-            .query(&[("key", client_api_key)])
+            .header("x-goog-api-key", client_api_key)
             .header("content-type", "application/json")
             .json(&body)
             .send()
