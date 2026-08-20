@@ -48,6 +48,10 @@ pub struct ClientProviderKeys {
     /// this key, RouterFuel routes *any* model through OpenRouter instead of
     /// requiring a separate key per lab — see main.rs `resolve_byok_route`.
     pub openrouter: Option<String>,
+    /// Azure OpenAI connection string: "endpoint=...;key=..." or "endpoint=...;identity=managed"
+    pub azure_openai: Option<String>,
+    /// AWS Bedrock connection string: "region=...;access_key=...;secret_key=..."
+    pub bedrock: Option<String>,
 }
 
 impl ClientProviderKeys {
@@ -70,6 +74,8 @@ impl ClientProviderKeys {
             meta: extract_header_string(headers, "x-meta-api-key")
                 .or_else(|| extract_header_string(headers, "x-llama-api-key")),
             openrouter: extract_header_string(headers, "x-openrouter-api-key"),
+            azure_openai: extract_header_string(headers, "x-azure-openai-connection"),
+            bedrock: extract_header_string(headers, "x-bedrock-connection"),
         }
     }
 
@@ -88,6 +94,8 @@ impl ClientProviderKeys {
             Provider::Zhipu      => self.zhipu.as_deref(),
             Provider::Meta       => self.meta.as_deref(),
             Provider::OpenRouter => self.openrouter.as_deref(),
+            Provider::AzureOpenAI => self.azure_openai.as_deref(),
+            Provider::Bedrock    => self.bedrock.as_deref(),
         }
     }
 
@@ -105,6 +113,8 @@ impl ClientProviderKeys {
             || self.zhipu.is_some()
             || self.meta.is_some()
             || self.openrouter.is_some()
+            || self.azure_openai.is_some()
+            || self.bedrock.is_some()
     }
 }
 
@@ -417,6 +427,8 @@ pub async fn cursor_bridge_middleware(mut request: Request<Body>, next: Next) ->
         "zhipu" | "glm"        => "x-zhipu-api-key",
         "meta" | "llama"       => "x-meta-api-key",
         "openrouter"           => "x-openrouter-api-key",
+        "azure" | "azure_openai" => "x-azure-openai-connection",
+        "bedrock" | "aws"      => "x-bedrock-connection",
         _ => {
             // FIX: was Box::leak()-ing a formatted String per bad request —
             // this middleware runs before auth/rate-limiting, so an
@@ -425,8 +437,8 @@ pub async fn cursor_bridge_middleware(mut request: Request<Body>, next: Next) ->
             // per-request allocation leaked, no echo of attacker input.
             return unauthorized(
                 "Unknown provider in composite key. Expected one of: openai, anthropic, \
-                 deepseek, gemini, mistral, xai, qwen, moonshot, zhipu, meta, openrouter. \
-                 See /docs/cursor for the composite key format.",
+                 deepseek, gemini, mistral, xai, qwen, moonshot, zhipu, meta, openrouter, \
+                 azure, bedrock. See /docs/cursor for the composite key format.",
             );
         }
     };

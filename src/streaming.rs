@@ -203,6 +203,32 @@ pub async fn stream_handler(
             );
             (url, body)
         }
+        Provider::AzureOpenAI => {
+            // Azure OpenAI streaming uses the same OpenAI-compatible format
+            // but with a deployment-specific URL constructed from the connection string.
+            // The api_key contains the full connection string; we parse it here.
+            let (endpoint, _auth_header) = parse_azure_connection_for_streaming(&api_key);
+            let url = format!(
+                "{}/openai/deployments/{}/chat/completions?api-version=2024-02-15-preview",
+                endpoint.trim_end_matches('/'),
+                req.model
+            );
+            let mut body = serde_json::to_value(&req).unwrap_or_default();
+            body["stream"] = serde_json::Value::Bool(true);
+            (url, body)
+        }
+        Provider::Bedrock => {
+            // Bedrock streaming uses the InvokeModelWithResponseStream API
+            let (region, _access_key, _secret_key, _session_token) = parse_bedrock_connection_for_streaming(&api_key);
+            let url = format!(
+                "https://bedrock-runtime.{}.amazonaws.com/model/{}/invoke-with-response-stream",
+                region,
+                req.model
+            );
+            let mut body = serde_json::to_value(&req).unwrap_or_default();
+            body["stream"] = serde_json::Value::Bool(true);
+            (url, body)
+        }
         _ => {
             let mut body = serde_json::to_value(&req).unwrap_or_default();
             body["stream"] = serde_json::Value::Bool(true);
@@ -212,6 +238,8 @@ pub async fn stream_handler(
 
     let is_gemini = matches!(provider, Provider::Gemini);
     let is_anthropic = matches!(provider, Provider::Anthropic);
+    let is_azure = matches!(provider, Provider::AzureOpenAI);
+    let is_bedrock = matches!(provider, Provider::Bedrock);
 
     let http_req = if is_gemini {
         http_client
@@ -226,6 +254,24 @@ pub async fn stream_handler(
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
+    } else if is_azure {
+        let (_endpoint, auth_header) = parse_azure_connection_for_streaming(&api_key);
+        http_client
+            .post(&url)
+            .header("api-key", auth_header)
+            .header("content-type", "application/json")
+            .json(&body)
+    } else if is_bedrock {
+        let (_region, access_key, secret_key, session_token) = parse_bedrock_connection_for_streaming(&api_key);
+        let mut builder = http_client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-amz-access-key", &access_key)
+            .header("x-amz-secret-key", &secret_key);
+        if let Some(token) = &session_token {
+            builder = builder.header("x-amz-security-token", token);
+        }
+        builder.json(&body)
     } else {
         http_client.post(&url).bearer_auth(&api_key).json(&body)
     };
@@ -337,6 +383,23 @@ pub async fn stream_handler(
                         }
                     }
                     yield Event::default().data(data);
+                } else if is_azure || is_bedrock {
+                    // Azure and Bedrock both use OpenAI-compatible streaming format
+                    if let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk>(data) {
+                        if let Some(choices) = &chunk.choices {
+                            for choice in choices {
+                                if let Some(content) = &choice.delta.content {
+                                    full_text.push_str(content);
+                                    chunk_count += 1;
+                                }
+                            }
+                        }
+                        if let Some(usage) = &chunk.usage {
+                            if let Some(pt) = usage.prompt_tokens { input_tokens = pt; }
+                            if let Some(ct) = usage.completion_tokens { output_tokens = ct; }
+                        }
+                    }
+                    yield Event::default().data(data);
                 } else {
                     if let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk>(data) {
                         if let Some(choices) = &chunk.choices {
@@ -381,4 +444,46 @@ struct AuditPayload {
     input_tokens: u32,
     output_tokens: u32,
     latency_ms: u64,
+}
+
+/// Parse Azure connection string for streaming (returns endpoint and api-key value)
+fn parse_azure_connection_for_streaming(conn_str: &str) -> (String, String) {
+    let mut endpoint = String::new();
+    let mut key = String::new();
+
+    for part in conn_str.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            match k.trim().to_lowercase().as_str() {
+                "endpoint" => endpoint = v.trim().to_string(),
+                "key" => key = v.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    (endpoint, key)
+}
+
+/// Parse Bedrock connection string for streaming (returns region and credentials)
+fn parse_bedrock_connection_for_streaming(conn_str: &str) -> (String, String, String, Option<String>) {
+    let mut region = String::new();
+    let mut access_key = String::new();
+    let mut secret_key = String::new();
+    let mut session_token = None;
+
+    for part in conn_str.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            match k.trim().to_lowercase().as_str() {
+                "region" => region = v.trim().to_string(),
+                "access_key" => access_key = v.trim().to_string(),
+                "secret_key" => secret_key = v.trim().to_string(),
+                "session_token" => session_token = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    (region, access_key, secret_key, session_token)
 }

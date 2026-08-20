@@ -240,6 +240,8 @@ fn reachable_providers(keys: &ClientProviderKeys) -> Option<HashSet<Provider>> {
     if keys.moonshot.is_some() { set.insert(Provider::Moonshot); }
     if keys.zhipu.is_some() { set.insert(Provider::Zhipu); }
     if keys.meta.is_some() { set.insert(Provider::Meta); }
+    if keys.azure_openai.is_some() { set.insert(Provider::AzureOpenAI); }
+    if keys.bedrock.is_some() { set.insert(Provider::Bedrock); }
     Some(set)
 }
 
