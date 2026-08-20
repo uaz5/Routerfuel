@@ -925,6 +925,10 @@ pub struct ConnectorManager {
 
 impl ConnectorManager {
     pub fn new(cb: Arc<CircuitBreaker>) -> Self {
+        let cb_openrouter = Arc::clone(&cb);
+        let cb_azure = Arc::clone(&cb);
+        let cb_bedrock = Arc::clone(&cb);
+
         Self {
             openai: GenericOpenAICompatibleConnector::new(
                 Provider::OpenAI,
@@ -971,14 +975,14 @@ impl ConnectorManager {
             openrouter: GenericOpenAICompatibleConnector::new(
                 Provider::OpenRouter,
                 provider_base_url(Provider::OpenRouter),
-                cb,
+                cb_openrouter,
             )
             .with_extra_headers(vec![
                 ("HTTP-Referer", "https://routerfuel.com"),
                 ("X-Title", "RouterFuel"),
             ]),
-            azure_openai: AzureOpenAIConnector::new(Arc::clone(&cb)),
-            bedrock: BedrockConnector::new(Arc::clone(&cb)),
+            azure_openai: AzureOpenAIConnector::new(cb_azure),
+            bedrock: BedrockConnector::new(cb_bedrock),
         }
     }
 
