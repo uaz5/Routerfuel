@@ -786,7 +786,8 @@ fn parse_azure_connection(conn_str: &str) -> Result<(String, String), ConnectorE
     })?;
 
     let auth_header = if let Some(k) = key {
-        format!("api-key {}", k)
+        // Azure's api-key header should contain just the raw key, no prefix.
+        k
     } else if let Some(id) = identity {
         if id == "managed" {
             // In production, this would use azure_identity crate to get a token.
@@ -1155,7 +1156,7 @@ async fn openai_compatible_call_with_auth_header(
     cb: &CircuitBreaker,
     extra_headers: &[(&'static str, &'static str)],
 ) -> Result<ConnectorResult, ConnectorError> {
-    let mut builder = client.post(url).header("Authorization", auth_header);
+    let mut builder = client.post(url).header("api-key", auth_header);
     for (k, v) in extra_headers {
         builder = builder.header(*k, *v);
     }
