@@ -5,6 +5,7 @@
 
 mod admin;
 mod auth;
+mod bedrock_catalog;
 mod circuit_breaker;
 mod client_registry;
 mod concurrency;
