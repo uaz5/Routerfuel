@@ -3,3 +3,4 @@ Routefuel2/
 target/
 target/
 .env
+.aider*
