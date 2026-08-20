@@ -1084,7 +1084,7 @@ async fn openai_compatible_call(
 async fn openai_compatible_call_with_builder(
     builder: reqwest::RequestBuilder,
     body: &serde_json::Value,
-    req: &ChatCompletionRequest,
+    _req: &ChatCompletionRequest,
     provider: Provider,
     cb: &CircuitBreaker,
 ) -> Result<ConnectorResult, ConnectorError> {
@@ -1146,7 +1146,7 @@ async fn openai_compatible_call_with_auth_header(
     client: &reqwest::Client,
     url: &str,
     auth_header: &str,
-    req: &ChatCompletionRequest,
+    _req: &ChatCompletionRequest,
     provider: Provider,
     cb: &CircuitBreaker,
     extra_headers: &[(&'static str, &'static str)],
@@ -1156,6 +1156,6 @@ async fn openai_compatible_call_with_auth_header(
         builder = builder.header(*k, *v);
     }
 
-    let body = build_openai_compatible_body(req);
-    openai_compatible_call_with_builder(builder, &body, req, provider, cb).await
+    let body = build_openai_compatible_body(_req);
+    openai_compatible_call_with_builder(builder, &body, _req, provider, cb).await
 }
