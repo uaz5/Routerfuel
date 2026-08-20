@@ -2,14 +2,16 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between your app and the LLM providers you already have keys for — Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Qwen, Moonshot, Zhipu, Meta, and OpenRouter as a universal fallback — and adds the routing, cost tracking, caching, and safety nets you'd otherwise have to build yourself.
+A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between your app and the LLM providers you already have keys for — Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Qwen, Moonshot, Zhipu, Meta, Azure OpenAI, AWS Bedrock, and OpenRouter as a universal fallback — and adds the routing, cost tracking, caching, and safety nets you'd otherwise have to build yourself.
 
 RouterFuel never holds a billable key of its own. Every request is billed to *your* provider account, using *your* key. RouterFuel's job is just to route it well, cache it when it can, and tell you what it cost.
 
 ## Features
 
 - **Smart routing** — pick a model by name, let RouterFuel auto-select on cost/latency/quality, or route by task type (`task:summarize`, `task:extract_action_items`, `task:draft_response`, `task:answer_question`, `task:classify`)
-- **BYOK across 11 providers** — supply your own key per provider via request headers; OpenRouter acts as a universal fallback if that's the only key you have
+- **BYOK across 13 providers** — supply your own key per provider via request headers; OpenRouter acts as a universal fallback if that's the only key you have
+- **Azure OpenAI** — bring your own Azure OpenAI deployment; supply an endpoint + API key (or managed identity) via the `X-Azure-OpenAI-Connection` header. Models are fetched dynamically from your Azure Foundry deployments list at startup
+- **AWS Bedrock** — bring your own AWS Bedrock access; supply region + IAM credentials via the `X-Bedrock-Connection` header. Available foundation models are fetched dynamically from the Bedrock `ListFoundationModels` API at startup
 - **Vision support** — send images (URL or base64) to any vision-capable model in the registry
 - **Semantic caching** — a local ONNX embedding model (no external API cost) matches semantically similar prompts and serves cached responses instead of re-calling a provider. Cached entries are scoped per client — two different clients sending the same prompt never share a cache entry
 - **Cost tracking & audit trail** — every request is logged with token counts, cost, latency, and savings vs. a GPT-4o baseline
@@ -18,7 +20,7 @@ RouterFuel never holds a billable key of its own. Every request is billed to *yo
 - **Concurrency limiting** — bounds in-flight provider calls so a traffic spike doesn't get you rate-limited or IP-blocked upstream
 - **Guardrails** — LoopGuard flags a client stuck retrying the same prompt; SpendGuard hard-caps per-client spend in a rolling window
 - **Shadow-mode A/B testing** — fire a second, comparison-only call at a different model alongside the real one, without affecting what the client receives. **Enabled by default** — any client can trigger it by sending `shadow_model` on a request, and it bills a second real call to their BYOK key
-- **Streaming** — full SSE streaming support for Anthropic, Gemini, and every OpenAI-compatible provider
+- **Streaming** — full SSE streaming support for Anthropic, Gemini, Azure OpenAI, Bedrock, and every OpenAI-compatible provider
 - **Admin dashboard** — a self-hosted, no-build-step web UI at `/admin/dashboard` visualizing spend, cache performance, per-model and per-client cost, the request timeline, rate-limit tiers, and shadow-mode comparisons — reads the `/admin/*` endpoints below in real time. The dashboard *page* itself is public; the data endpoints it calls each require `X-Admin-Key`
 - **Cursor integration** — point Cursor's custom OpenAI-compatible model settings straight at RouterFuel and route your editor's requests through your own provider keys
 
@@ -101,12 +103,38 @@ RouterFuel is now listening on `http://localhost:3000` (or whatever `HOST`/`PORT
 
 See [USAGE.md](https://github.com/uaz5/Routerfuel/blob/main/USAGE.md) for how to actually call it, including the admin dashboard UI and Cursor setup.
 
+## BYOK Provider Headers
+
+RouterFuel is pure BYOK — you supply your own keys per provider via request headers. Here are the headers for each supported provider:
+
+| Provider       | Header                          | Value Format                                                                 |
+| -------------- | ------------------------------- | ---------------------------------------------------------------------------- |
+| OpenAI         | `X-OpenAI-Api-Key`              | `sk-proj-...` (standard OpenAI API key)                                      |
+| Anthropic      | `X-Anthropic-Api-Key`           | `sk-ant-...` (standard Anthropic API key)                                    |
+| Gemini         | `X-Gemini-Api-Key`              | Your Google AI Studio API key                                                |
+| DeepSeek       | `X-DeepSeek-Api-Key`            | Your DeepSeek API key                                                        |
+| Mistral        | `X-Mistral-Api-Key`             | Your Mistral API key                                                         |
+| xAI (Grok)     | `X-XAI-Api-Key`                 | Your xAI API key                                                             |
+| Qwen           | `X-Qwen-Api-Key`                | Your Alibaba DashScope API key                                               |
+| Moonshot (Kimi)| `X-Moonshot-Api-Key`            | Your Moonshot API key                                                        |
+| Zhipu (GLM)    | `X-Zhipu-Api-Key`               | Your Zhipu API key                                                           |
+| Meta (Llama)   | `X-Meta-Api-Key`                | Your Meta Llama API key                                                      |
+| OpenRouter     | `X-OpenRouter-Api-Key`          | `sk-or-...` (standard OpenRouter API key) — acts as universal fallback       |
+| Azure OpenAI   | `X-Azure-OpenAI-Connection`     | `endpoint=https://my-resource.openai.azure.com;key=abc123` or `endpoint=...;identity=managed` |
+| AWS Bedrock    | `X-Bedrock-Connection`          | `region=us-east-1;access_key=AKIA...;secret_key=...`                         |
+
+**OpenRouter fallback:** If you only supply an `X-OpenRouter-Api-Key` (no direct provider keys), RouterFuel routes *any* model through OpenRouter automatically — you don't need a separate key for each provider.
+
+**Azure OpenAI:** Supply your Azure OpenAI endpoint and either an API key or `identity=managed` for managed identity auth. RouterFuel fetches your available deployments from the Azure Foundry deployments list endpoint at startup, so models appear automatically in the registry.
+
+**AWS Bedrock:** Supply your AWS region and IAM credentials (access key + secret key). RouterFuel fetches available foundation models from the Bedrock `ListFoundationModels` API at startup. In production, proper AWS SigV4 signing is used; for testing, credentials can be passed as headers.
+
 ## Project structure
 
 ```
 src/
   main.rs                 — HTTP server, routing glue, request handlers
-  connectors.rs            — per-provider HTTP clients (Anthropic, Gemini, OpenAI-compatible)
+  connectors.rs            — per-provider HTTP clients (Anthropic, Gemini, Azure OpenAI, Bedrock, OpenAI-compatible)
   route_engine.rs           — model registry + routing decisions
   auth.rs                   — API key validation, BYOK header extraction, Cursor composite-key bridge
   rate_limiter.rs           — per-client tiered rate limiting
@@ -123,6 +151,7 @@ src/
   streaming.rs              — SSE streaming handler
   admin.rs                  — /admin/* dashboard data endpoints, incl. /audit/daily
   openrouter_catalog.rs     — pulls OpenRouter's public model list into the registry
+  bedrock_catalog.rs        — pulls AWS Bedrock's foundation model list into the registry
 static/
   dashboard.html            — self-contained admin dashboard UI, served at /admin/dashboard
 migrations/                — Postgres schema, run in numeric order (001–007)
