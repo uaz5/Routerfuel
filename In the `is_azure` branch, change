@@ -1,4 +1,0 @@
-let (_endpoint, auth_header) = parse_azure_connection_for_streaming(&api_key);
-http_client
-    .post(&url)
-    .header("api-key", auth_header)
