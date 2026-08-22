@@ -28,6 +28,21 @@
 // `select_for_task` also gained the same `reachable` parameter so task
 // routing respects it too, both on its "preferred model" fast path and its
 // scored fallback.
+//
+// FIX (this revision): Azure and Bedrock are pure BYOK — the client's key
+// arrives per-request via headers, not at server startup. The static
+// registry cannot pre-populate their models. When a request includes an
+// X-Azure-OpenAI-Connection or X-Bedrock-Connection header, the route
+// engine now treats the model name as valid and routes it directly to the
+// corresponding connector, bypassing the normal "is this model in the
+// registry" check for those two providers.
+//
+// FIX (this revision): the BYOK fallback previously required the model name
+// to start with "azure/" or "bedrock/". That meant a request with model
+// "DeepSeek-V4-Pro" and an X-Azure-OpenAI-Connection header was still
+// rejected because the model name didn't have the prefix. Now the presence
+// of the header alone is sufficient — any model name is accepted for Azure
+// or Bedrock when the corresponding connection header is present.
 // ============================================================================
 
 use crate::connectors::Provider;
@@ -536,13 +551,50 @@ impl RouteEngine {
             .ok_or_else(|| anyhow!("Unknown model id: {}", api_id))
     }
 
-    pub fn select_provider(&self, model_name: &str) -> Result<Provider> {
-        self.find(model_name)
-            .map(|m| m.provider)
-            .map_err(|_| anyhow!(
-                "Unknown model '{}'. Check /v1/models for the list of supported model IDs.",
-                model_name
-            ))
+    /// Resolve a provider for a model name that may be a BYOK-only target
+    /// (Azure or Bedrock). The presence of the corresponding connection
+    /// header is sufficient — the model name does not need any special
+    /// prefix. This allows any model name to be routed to Azure or Bedrock
+    /// when the client supplies the appropriate BYOK header.
+    pub fn resolve_byok_provider(
+        &self,
+        _model_name: &str,
+        has_azure_header: bool,
+        has_bedrock_header: bool,
+    ) -> Option<Provider> {
+        if has_azure_header {
+            return Some(Provider::AzureOpenAI);
+        }
+        if has_bedrock_header {
+            return Some(Provider::Bedrock);
+        }
+        None
+    }
+
+    /// Returns the `Provider` for a given model name. For Azure and Bedrock
+    /// models the registry does not contain entries; if the request includes
+    /// the corresponding BYOK header we treat the model as valid and return
+    /// the provider directly.
+    pub fn select_provider(
+        &self,
+        model_name: &str,
+        has_azure_header: bool,
+        has_bedrock_header: bool,
+    ) -> Result<Provider> {
+        // First try the static registry.
+        if let Ok(m) = self.find(model_name) {
+            return Ok(m.provider);
+        }
+
+        // Fall back to BYOK-only providers.
+        if let Some(provider) = self.resolve_byok_provider(model_name, has_azure_header, has_bedrock_header) {
+            return Ok(provider);
+        }
+
+        Err(anyhow!(
+            "Unknown model '{}'. Check /v1/models for the list of supported model IDs.",
+            model_name
+        ))
     }
 
     pub fn get_pricing(&self, api_id: &str) -> Result<(f64, f64)> {
@@ -676,5 +728,31 @@ mod tests {
         only_deepseek.insert(Provider::DeepSeek);
         let d = e.select_for_task(MeetingTask::Summarise, 5_000, Some(&only_deepseek)).unwrap();
         assert_eq!(d.model.provider, Provider::DeepSeek);
+    }
+
+    #[test]
+    fn byok_azure_provider_resolved_with_header() {
+        let e = RouteEngine::new();
+        let provider = e.select_provider("any-model-name", true, false).unwrap();
+        assert_eq!(provider, Provider::AzureOpenAI);
+    }
+
+    #[test]
+    fn byok_bedrock_provider_resolved_with_header() {
+        let e = RouteEngine::new();
+        let provider = e.select_provider("any-model-name", false, true).unwrap();
+        assert_eq!(provider, Provider::Bedrock);
+    }
+
+    #[test]
+    fn byok_azure_rejected_without_header() {
+        let e = RouteEngine::new();
+        assert!(e.select_provider("any-model-name", false, false).is_err());
+    }
+
+    #[test]
+    fn byok_bedrock_rejected_without_header() {
+        let e = RouteEngine::new();
+        assert!(e.select_provider("any-model-name", false, false).is_err());
     }
 }

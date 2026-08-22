@@ -305,6 +305,9 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, request: ChatComp
     // FIX: pricing + reservation, same pattern as handle_non_streaming.
     let (cost_per_1m_input, cost_per_1m_output) = match state.route_engine.get_pricing(&routing_model_id) {
         Ok(p) => p,
+        // BYOK-only providers (Azure/Bedrock): billed to the client's own
+        // provider account, so RouterFuel has no rates to apply.
+        Err(_) if matches!(selected_provider, Provider::AzureOpenAI | Provider::Bedrock) => (0.0, 0.0),
         Err(e) => {
             error!("Pricing lookup failed: {}", e);
             return ApiError::InternalError("Pricing lookup failed".to_string()).into_response();
@@ -405,7 +408,11 @@ fn resolve_model(
     // the client genuinely has no way to call it.
     let provider = state
         .route_engine
-        .select_provider(&request.model)
+        .select_provider(
+            &request.model,
+            keys.azure_openai.is_some(),
+            keys.bedrock.is_some(),
+        )
         .map_err(|e| {
             error!("Routing failed: {}", e);
             ApiError::ProviderError("No available providers".to_string())
@@ -517,7 +524,7 @@ async fn handle_non_streaming(
             // here never blocks serving the cached response.
             let cache_hit_provider = state
                 .route_engine
-                .select_provider(&cached_response.model)
+                .select_provider(&cached_response.model, false, false)
                 .unwrap_or(Provider::OpenRouter);
 
             state.cost_tracker.record_request(
@@ -575,13 +582,17 @@ async fn handle_non_streaming(
         );
     }
 
-    let (cost_per_1m_input, cost_per_1m_output) = state
-        .route_engine
-        .get_pricing(&routing_model_id)
-        .map_err(|e| {
+    let (cost_per_1m_input, cost_per_1m_output) = match state.route_engine.get_pricing(&routing_model_id) {
+        Ok(p) => p,
+        // BYOK-only providers (Azure/Bedrock) have no registry entry and so no
+        // known rates — the client is billed directly by their own Azure/AWS
+        // account. Treat as zero-cost rather than failing the request.
+        Err(_) if matches!(selected_provider, Provider::AzureOpenAI | Provider::Bedrock) => (0.0, 0.0),
+        Err(e) => {
             error!("Pricing lookup failed: {}", e);
-            ApiError::InternalError("Pricing lookup failed".to_string())
-        })?;
+            return Err(ApiError::InternalError("Pricing lookup failed".to_string()));
+        }
+    };
 
     let estimated_cost = TokenCostBreakdown::new(
         input_tokens,
@@ -838,7 +849,11 @@ fn maybe_fire_shadow_request(
 
     tokio::spawn(async move {
         // Step 1: resolve the shadow model's provider. No budget touched yet.
-        let shadow_provider = match route_engine.select_provider(&shadow_model_id) {
+        // Shadow models resolve from the registry only: the BYOK fallback
+        // accepts any model name when an Azure/Bedrock header is present, so
+        // passing it here would turn a typo'd shadow model into a real
+        // billable provider call the client never asked for.
+        let shadow_provider = match route_engine.select_provider(&shadow_model_id, false, false) {
             Ok(p) => p,
             Err(e) => {
                 debug!(shadow_model = %shadow_model_id, "Shadow mode: unknown model ({e}), skipping");
