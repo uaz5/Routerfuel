@@ -125,9 +125,9 @@ RouterFuel is pure BYOK — you supply your own keys per provider via request he
 
 **OpenRouter fallback:** If you only supply an `X-OpenRouter-Api-Key` (no direct provider keys), RouterFuel routes *any* model through OpenRouter automatically — you don't need a separate key for each provider.
 
-**Azure OpenAI:** Supply your Azure OpenAI endpoint and either an API key or `identity=managed` for managed identity auth. RouterFuel fetches your available deployments from the Azure Foundry deployments list endpoint at startup, so models appear automatically in the registry.
+**Azure OpenAI:** Supply your Azure OpenAI endpoint and either an API key or `identity=managed` for managed identity auth. RouterFuel fetches your available deployments from the Azure Foundry deployments list endpoint at startup, so models appear automatically in the registry. That list isn't a restriction, though: whenever the connection header is present, *any* model name is accepted and routed straight to your Azure deployment — no name prefix and no pre-registration required, since the header itself is proof you can pay for the call.
 
-**AWS Bedrock:** Supply your AWS region and IAM credentials (access key + secret key). RouterFuel fetches available foundation models from the Bedrock `ListFoundationModels` API at startup. In production, proper AWS SigV4 signing is used; for testing, credentials can be passed as headers.
+**AWS Bedrock:** Supply your AWS region and IAM credentials (access key + secret key). RouterFuel fetches available foundation models from the Bedrock `ListFoundationModels` API at startup. In production, proper AWS SigV4 signing is used; for testing, credentials can be passed as headers. As with Azure, that list isn't a restriction — with the connection header present, *any* model name is accepted and routed to Bedrock, with no prefix or pre-registration needed.
 
 ## Project structure
 
