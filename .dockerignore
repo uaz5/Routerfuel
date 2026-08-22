@@ -1,0 +1,37 @@
+# =============================================================================
+# .dockerignore — RouterFuel
+#
+# Without this file Docker ships the whole working directory to the daemon as
+# build context on every single build — ./target alone is ~2.5 GB, plus
+# ./models and a real .env. The Dockerfile only ever COPYs Cargo.toml,
+# Cargo.lock, src/, migrations/ and static/, so everything else is dead weight
+# that buys nothing but a slower build.
+#
+# .env stays excluded even though this Dockerfile never COPYs it: the published
+# image is public, and a future `COPY . .` would otherwise bake local secrets
+# straight into it. Cheap insurance.
+# =============================================================================
+
+# Rust build output — by far the biggest offender.
+target/
+
+# Optional ONNX embedding model + tokenizer. Mounted at runtime as a volume
+# (see docker-compose.yml), never needed at build time.
+models/
+
+# Local secrets.
+.env
+.env.*
+
+# Version control, editor and agent scratch files.
+.git/
+.gitignore
+.aider*
+.vscode/
+.idea/
+
+# Docs and container config — not inputs to the compiled binary.
+*.md
+Dockerfile
+.dockerignore
+docker-compose*.yml

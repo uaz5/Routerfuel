@@ -1,0 +1,21 @@
+# =============================================================================
+# docker-compose.build.yml — RouterFuel (build-from-source override)
+#
+# The base docker-compose.yml pulls a prebuilt image so a fresh clone starts in
+# seconds instead of spending 10-15 minutes compiling Rust. Contributors
+# changing the Rust code want the opposite, so layer this file on top to build
+# the app service from the local Dockerfile:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+#
+# Everything else — Postgres, env vars, volumes, ports — is inherited unchanged
+# from the base file.
+# =============================================================================
+
+services:
+  app:
+    build: .
+    # Retag the local build so it can't masquerade as (or be mistaken for) the
+    # published image the base file pins. Without this, `build` would inherit
+    # the base file's `image:` and overwrite the published tag locally.
+    image: routerfuel-local:dev

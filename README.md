@@ -37,12 +37,24 @@ git clone https://github.com/uaz5/Routerfuel.git
 cd Routerfuel
 cp env.example .env         # then fill in ROUTERFUEL_ADMIN_KEY at minimum
 ./scripts/generate-key.sh "MyFirstClient"   # copy the hash line into .env's ROUTERFUEL_API_KEYS
-docker compose up --build
+docker compose up
 ```
 
 This starts Postgres with `pgvector` pre-installed and runs migrations automatically on first boot — no manual database setup. RouterFuel listens on `http://localhost:3000`.
 
+No `--build` needed: the `app` service pulls a prebuilt image (`nayilumair/routerfuel:0.6.0`), so first run takes seconds instead of the 10-15 minutes a from-scratch Rust compile costs.
+
 Semantic caching (local ONNX embeddings) stays off until you drop a model + tokenizer into `./models/` — see `docker-compose.yml` for the exact paths. Everything else works without it.
+
+### Building from source (contributors)
+
+If you're changing the Rust code, layer on the build override to compile locally instead of pulling:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+```
+
+That builds the `app` service from the local `Dockerfile` and tags it `routerfuel-local:dev`, leaving the published image alone. Everything else — Postgres, env vars, volumes, ports — is inherited from the base compose file.
 
 **Heads up if you're building this yourself:** the container build needs network access (the `ort` crate downloads ONNX Runtime binaries during compilation), and the ONNX shared library path is the one part of this setup that's genuinely a little fragile across environments — see the comments at the top of the `Dockerfile` if `docker compose up` starts fine but logs a warning that the embedding model didn't load. The gateway itself runs correctly either way; only semantic caching is affected.
 
@@ -159,6 +171,7 @@ scripts/
   generate-key.sh           — generates a client API key + its SHA-256 hash
 Dockerfile                  — multi-stage build (see Quickstart above)
 docker-compose.yml          — RouterFuel + Postgres/pgvector wired together
+docker-compose.build.yml    — override to build from source instead of pulling
 env.example                 — copy to .env before `docker compose up`
 ```
 

@@ -1,9 +1,12 @@
 # =============================================================================
 # docker-compose.yml — RouterFuel
 #
-# `docker compose up --build` gets you: Postgres with pgvector pre-installed,
+# `docker compose up` gets you: Postgres with pgvector pre-installed,
 # migrations run automatically on RouterFuel's first boot (sqlx::migrate! in
-# main.rs), and the gateway listening on :3000.
+# main.rs), and the gateway listening on :3000. The app service pulls a
+# prebuilt image, so this takes seconds rather than the 10-15 minutes a
+# from-scratch Rust compile costs. To build from source instead, layer on
+# docker-compose.build.yml (see that file).
 #
 # Semantic caching stays OFF until you drop an ONNX embedding model +
 # tokenizer into ./models — see the `models` volume below. Everything else
@@ -31,7 +34,7 @@ services:
       retries: 10
 
   app:
-    build: .
+    image: nayilumair/routerfuel:0.6.0
     restart: unless-stopped
     depends_on:
       db:
