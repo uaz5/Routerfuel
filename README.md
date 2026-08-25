@@ -42,9 +42,9 @@ docker compose up
 
 This starts Postgres with `pgvector` pre-installed and runs migrations automatically on first boot — no manual database setup. RouterFuel listens on `http://localhost:3000`.
 
-No `--build` needed: the `app` service pulls a prebuilt image (`nayilumair/routerfuel:0.6.0`), so first run takes seconds instead of the 10-15 minutes a from-scratch Rust compile costs.
+No `--build` needed: the `app` service pulls a prebuilt image (`nayilumair/routerfuel:0.6.1`), so first run takes seconds instead of the 10-15 minutes a from-scratch Rust compile costs.
 
-Semantic caching (local ONNX embeddings) stays off until you drop a model + tokenizer into `./models/` — see `docker-compose.yml` for the exact paths. Everything else works without it.
+Semantic caching (local ONNX embeddings) is on out of the box — the model and tokenizer are committed to this repo under `./models/`, and compose mounts them into the container, so there's nothing to download or convert. If those files are missing or unreadable the gateway still runs normally with semantic caching disabled; look for `Local ONNX embedding model loaded — semantic cache active` in the startup log to confirm it's active. Note the models are mounted by compose rather than baked into the image, so running the image on its own leaves caching off.
 
 ### Building from source (contributors)
 
@@ -83,11 +83,12 @@ Migrations run automatically on startup too, via `sqlx::migrate!` in `main.rs`.
 | Variable                        | Required | Default       | Purpose                                                             |
 | -------------------------------- | -------- | ------------- | -------------------------------------------------------------------- |
 | `DATABASE_URL`                  | yes      | —             | Postgres connection string                                          |
-| `ROUTERFUEL_API_KEYS`           | no       | empty         | Client API keys, format `sha256hex:ClientName,sha256hex:ClientName` |
-| `ROUTERFUEL_CLIENT_TIERS`       | no       | empty         | Per-client rate tiers, format `raw_key:pro,raw_key:enterprise`      |
+| `ROUTERFUEL_API_KEYS`           | no       | empty         | Fallback/override client API keys, format `sha256hex:ClientName,...`. The `client_tiers` Postgres table is the primary source of keys and tiers |
+| `ROUTERFUEL_CLIENT_TIERS`       | no       | empty         | Fallback per-client tiers, format `raw_key:pro,raw_key:enterprise`. Applied once at startup; `client_tiers` rows override |
+| `ROUTERFUEL_CLIENT_SYNC_SECS`   | no       | 30            | How often to re-read the `client_tiers` table for new keys and tier changes |
 | `ROUTERFUEL_ADMIN_KEY`          | no       | empty         | Key required to access `/admin/*` endpoints (`X-Admin-Key` header)  |
-| `EMBEDDING_MODEL_PATH`          | no       | `./models/embedding.onnx` | Path to your local ONNX embedding model (enables semantic cache) |
-| `EMBEDDING_TOKENIZER_PATH`      | no       | `./models/tokenizer.json` | Path to the matching tokenizer.json                       |
+| `EMBEDDING_MODEL_PATH`          | no       | `./models/embedding.onnx` | ONNX embedding model path (ships with the repo; enables semantic cache) |
+| `EMBEDDING_TOKENIZER_PATH`      | no       | `./models/tokenizer.json` | Matching tokenizer path (ships with the repo)              |
 | `LOOP_GUARD_REPEAT_THRESHOLD`   | no       | 4             | Repeats of an identical prompt before it's flagged as a loop        |
 | `LOOP_GUARD_WINDOW_SECS`        | no       | 60            | Window LoopGuard checks over                                        |
 | `MAX_SPEND_CENTS_PER_CLIENT`    | no       | 5000          | Per-client spend cap (cents) per window                             |

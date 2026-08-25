@@ -8,11 +8,16 @@
 # from-scratch Rust compile costs. To build from source instead, layer on
 # docker-compose.build.yml (see that file).
 #
-# Semantic caching stays OFF until you drop an ONNX embedding model +
-# tokenizer into ./models — see the `models` volume below. Everything else
-# works without it; the gateway just won't cache semantically similar
-# prompts (exact-hash cache still applies regardless — see
-# src/semantic_cache.rs).
+# Semantic caching is ON out of the box: models/embedding.onnx and
+# models/tokenizer.json are committed to this repo, so a plain `git clone`
+# already has everything the embedder needs, and the `models` volume below
+# mounts them into the container. Nothing to download or convert.
+#
+# It degrades gracefully rather than failing: if those files are missing or
+# unreadable, embedder::load() logs a warning at startup and the gateway runs
+# normally with semantic caching disabled (the exact-hash cache still
+# applies — see src/semantic_cache.rs). Look for "Local ONNX embedding model
+# loaded — semantic cache active" in the startup log to confirm it's on.
 # =============================================================================
 
 services:
@@ -58,18 +63,22 @@ services:
       # (30). Lower it if you want new signups/tier upgrades to apply faster.
       ROUTERFUEL_CLIENT_SYNC_SECS: ${ROUTERFUEL_CLIENT_SYNC_SECS:-30}
 
-      # Only takes effect if you've dropped model files into ./models — see
-      # the volume mount below. If the files aren't there, embedder::load()
-      # fails gracefully at startup (logged, not fatal) and semantic caching
-      # just stays off.
+      # Container-side paths for the model files the repo ships, mounted via
+      # the `models` volume below. Override only if you're pointing at a
+      # different embedding model — but note migration 005 fixes the vector
+      # column's dimension, so a model with a different output size needs that
+      # migration changed too (see src/semantic_cache.rs's
+      # embedding_dims_matches_migration_005 test).
       EMBEDDING_MODEL_PATH: /app/models/embedding.onnx
       EMBEDDING_TOKENIZER_PATH: /app/models/tokenizer.json
     ports:
       - "3000:3000"
     volumes:
-      # Optional. Drop an ONNX sentence-embedding model (e.g. all-MiniLM-L6-v2,
-      # converted to .onnx) + its tokenizer.json in here to enable semantic
-      # caching. Leave empty and the gateway runs fine without it.
+      # The ONNX sentence-embedding model + tokenizer that power semantic
+      # caching. Both are committed to the repo, so this directory is already
+      # populated after a clone — mounted read-only because the gateway only
+      # ever reads them. Not baked into the image (see .dockerignore), which
+      # is why running the image without compose leaves caching disabled.
       - ./models:/app/models:ro
 
 volumes:
