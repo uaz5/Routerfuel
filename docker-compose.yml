@@ -34,7 +34,7 @@ services:
       retries: 10
 
   app:
-    image: nayilumair/routerfuel:0.6.0
+    image: nayilumair/routerfuel:0.6.1
     restart: unless-stopped
     depends_on:
       db:
@@ -45,10 +45,18 @@ services:
       PORT: 3000
 
       # See env.example — copy it to .env and fill these in before running.
+      # Both of these are now fallback/override layers only: the `client_tiers`
+      # table is the live source of truth for keys and tiers, and the gateway
+      # re-reads it on a timer, so neither var is required to provision a key.
       ROUTERFUEL_API_KEYS: ${ROUTERFUEL_API_KEYS:-}
       ROUTERFUEL_CLIENT_TIERS: ${ROUTERFUEL_CLIENT_TIERS:-}
       ROUTERFUEL_ADMIN_KEY: ${ROUTERFUEL_ADMIN_KEY:-}
       ENABLE_SHADOW_MODE: ${ENABLE_SHADOW_MODE:-true}
+
+      # How often to re-read the client_tiers table, in seconds. Unset is
+      # fine — main.rs falls back to client_registry::DEFAULT_SYNC_INTERVAL_SECS
+      # (30). Lower it if you want new signups/tier upgrades to apply faster.
+      ROUTERFUEL_CLIENT_SYNC_SECS: ${ROUTERFUEL_CLIENT_SYNC_SECS:-30}
 
       # Only takes effect if you've dropped model files into ./models — see
       # the volume mount below. If the files aren't there, embedder::load()
