@@ -9,8 +9,22 @@
 //   5. If invalid → returns 401 immediately, request never reaches the handler
 //   6. Also provides ClientProviderKeys extractor for BYOK provider headers
 //
-// Key store is loaded once at startup from the ROUTERFUEL_API_KEYS env var.
-// Format:  sha256hex:ClientName,sha256hex:ClientName,...
+// The key store has TWO layers:
+//
+//   1. DB layer (primary) — the `client_tiers` table, kept live by the
+//      background sync in client_registry.rs (default every 30s). Rows added
+//      or revoked by an external provisioning app take effect without a
+//      restart. See migrations/008_dynamic_api_keys.sql.
+//
+//   2. Env layer (fallback / break-glass) — the ROUTERFUEL_API_KEYS env var,
+//      parsed once at startup and never mutated.
+//      Format:  sha256hex:ClientName,sha256hex:ClientName,...
+//
+// Lookup order and why: a key present in the DB is answered from the DB, so
+// an explicit `active = false` row is a real revocation that the env var
+// cannot override. A key ABSENT from the DB falls back to the env layer,
+// which is what keeps ROUTERFUEL_API_KEYS working on its own — including
+// when Postgres is unreachable and the DB layer is stale or empty.
 //
 // To generate a key hash on the command line:
 //   echo -n "rf_live_yoursecretkey" | sha256sum | awk '{print $1}'
@@ -23,6 +37,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use parking_lot::RwLock;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc};
@@ -128,17 +143,43 @@ fn extract_header_string(headers: &HeaderMap, key: &str) -> Option<String> {
 }
 
 // =============================================================================
-// ApiKeyStore — loaded once, shared via Arc, read-only after init
+// ApiKeyStore — env layer is read-only after init; DB layer is live-swapped
+// by client_registry.rs's background sync.
 // =============================================================================
 
+/// One provisioned key as it exists in the `client_tiers` table — only the
+/// fields authentication actually decides on. The row's `tier` is not held
+/// here: client_registry.rs applies it straight to the RateLimiter, which is
+/// what the request path consults, so keeping a second copy here would just
+/// be a value that can drift.
+///
+/// `active` is carried rather than filtered out at query time on purpose: an
+/// inactive row still has to *shadow* the env layer, otherwise revoking a key
+/// in the DB would silently fall through to ROUTERFUEL_API_KEYS and keep
+/// working.
+#[derive(Debug, Clone)]
+pub struct DbKeyRecord {
+    pub client_name: String,
+    pub active: bool,
+}
+
 pub struct ApiKeyStore {
-    /// sha256_hex → client display name
-    keys: HashMap<String, String>,
+    /// Env layer: sha256_hex → client display name. Immutable after init.
+    env_keys: HashMap<String, String>,
+    /// DB layer: sha256_hex → record from `client_tiers`. Replaced wholesale
+    /// by `replace_db_keys` on each successful sync. `RwLock` (parking_lot,
+    /// same as RateLimiter) because reads happen on every request and writes
+    /// once per sync interval.
+    db_keys: RwLock<HashMap<String, DbKeyRecord>>,
 }
 
 impl ApiKeyStore {
     /// Parse the ROUTERFUEL_API_KEYS env var.
     /// Expected format:  "sha256hex:ClientA,sha256hex:ClientB"
+    ///
+    /// The DB layer starts empty; it is populated by the first
+    /// `client_registry::sync_clients_from_db` call before the server begins
+    /// accepting traffic.
     pub fn from_env_string(raw: &str) -> Self {
         let mut keys = HashMap::new();
 
@@ -168,8 +209,19 @@ impl ApiKeyStore {
             }
         }
 
-        tracing::info!("Loaded {} API key(s) into auth store", keys.len());
-        Self { keys }
+        tracing::info!("Loaded {} API key(s) into auth store from env", keys.len());
+        Self {
+            env_keys: keys,
+            db_keys: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Swap in a fresh snapshot of `client_tiers`. Called by
+    /// client_registry.rs after a successful query — and *only* after a
+    /// successful one, so a transient Postgres outage leaves the last
+    /// known-good snapshot in place instead of 401-ing every client.
+    pub fn replace_db_keys(&self, keys: HashMap<String, DbKeyRecord>) {
+        *self.db_keys.write() = keys;
     }
 
    /// Validate a raw API key. Returns (client_hash, client_name) if valid.
@@ -177,17 +229,56 @@ impl ApiKeyStore {
     /// the system — rate_limiter, spend_guard, loop_guard, and the
     /// client_tiers table all key off SHA-256(raw_key) (see
     /// migrations/003_client_tiers.sql). `client_name` is display-only.
-    pub fn validate(&self, raw_key: &str) -> Option<(&str, &str)> {
+    ///
+    /// Owned Strings rather than borrowed &str: the DB layer lives behind an
+    /// RwLock, so nothing can outlive the read guard.
+    ///
+    /// DB layer wins when the key is present there at all (see the lookup
+    /// order note at the top of this file); the env layer answers only for
+    /// keys the DB has never heard of.
+    pub fn validate(&self, raw_key: &str) -> Option<(String, String)> {
         let hash = sha256_hex(raw_key);
-        self.keys.get_key_value(&hash).map(|(h, n)| (h.as_str(), n.as_str()))
+
+        // DB layer first — this is the authoritative one.
+        if let Some(record) = self.db_keys.read().get(&hash) {
+            if !record.active {
+                // Explicitly revoked. Do NOT fall through to the env layer:
+                // that would make `active = false` unenforceable for any key
+                // that also happens to be listed in ROUTERFUEL_API_KEYS.
+                if self.env_keys.contains_key(&hash) {
+                    warn!(
+                        client = %record.client_name,
+                        "API key is revoked (client_tiers.active = false) but is also present in \
+                         ROUTERFUEL_API_KEYS — honouring the revocation. Remove it from the env \
+                         var too, or set active = true to re-enable."
+                    );
+                }
+                return None;
+            }
+            return Some((hash, record.client_name.clone()));
+        }
+
+        // Fallback: env layer. Keeps ROUTERFUEL_API_KEYS working standalone,
+        // and keeps those keys working if the DB sync has never succeeded.
+        self.env_keys
+            .get(&hash)
+            .map(|name| (hash.clone(), name.clone()))
     }
 
+    /// Number of keys in the env layer. The DB layer is reported separately
+    /// by `db_len` since the two have very different lifecycles.
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.env_keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.env_keys.is_empty()
+    }
+
+    /// Count of currently-active keys in the DB layer — for startup logging
+    /// and to tell "sync has not run yet" apart from "no keys provisioned".
+    pub fn db_active_len(&self) -> usize {
+        self.db_keys.read().values().filter(|r| r.active).count()
     }
 }
 
@@ -237,10 +328,10 @@ pub async fn api_key_middleware(
         }
     };
 
-    // Validate against the store
+    // Validate against the store (DB layer first, env layer as fallback)
     match store.validate(&raw_key) {
         Some((client_hash, client_name)) => {
-            debug!(client = client_name, client_hash = &client_hash[..8], "API key validated");
+            debug!(client = %client_name, client_hash = &client_hash[..8], "API key validated");
 
             // FIX: inject the HASH, not the display name — this is what
             // client_registry.rs registers tiers under, and what
@@ -256,10 +347,14 @@ pub async fn api_key_middleware(
             next.run(request).await
         }
         None => {
-            warn!(
-                key_prefix = &raw_key[..raw_key.len().min(8)],
-                "Invalid API key"
-            );
+            // FIX: was `&raw_key[..raw_key.len().min(8)]`, which slices by
+            // BYTES. A header value is only guaranteed valid UTF-8 here (we
+            // checked with to_str()), not ASCII — so a key whose first 8
+            // bytes land mid-codepoint panicked the handler. Unauthenticated
+            // and remotely triggerable: `X-API-Key: ééééé` was enough.
+            // chars() respects codepoint boundaries and can't panic.
+            let key_prefix: String = raw_key.chars().take(8).collect();
+            warn!(key_prefix = %key_prefix, "Invalid API key");
             unauthorized("Invalid API key")
         }
     }
@@ -293,8 +388,12 @@ mod tests {
     fn valid_key_returns_client_name() {
         let store = store_with("rf_live_supersecret", "AcmeCorp");
         let hash = sha256_hex("rf_live_supersecret");
-        // FIX: validate() now returns Some((hash, name)) instead of Some(name)
-        assert_eq!(store.validate("rf_live_supersecret"), Some((hash.as_str(), "AcmeCorp")));
+        // validate() returns owned Strings now that the DB layer lives behind
+        // an RwLock — nothing can borrow out past the read guard.
+        assert_eq!(
+            store.validate("rf_live_supersecret"),
+            Some((hash, "AcmeCorp".to_string()))
+        );
     }
     
     #[test]
@@ -317,9 +416,8 @@ mod tests {
         let env_str = format!("{k1}:ClientA,{k2}:ClientB");
         let store = ApiKeyStore::from_env_string(&env_str);
         assert_eq!(store.len(), 2);
-        // FIX: same tuple-return update
-        assert_eq!(store.validate("key_one"), Some((k1.as_str(), "ClientA")));
-        assert_eq!(store.validate("key_two"), Some((k2.as_str(), "ClientB")));
+        assert_eq!(store.validate("key_one"), Some((k1, "ClientA".to_string())));
+        assert_eq!(store.validate("key_two"), Some((k2, "ClientB".to_string())));
     }
 
     #[test]
@@ -333,9 +431,111 @@ mod tests {
     fn key_not_stored_in_plaintext() {
         let store = store_with("rf_live_plaintextkey", "TestClient");
         // The raw key must not appear anywhere in the keys map
-        for k in store.keys.keys() {
+        for k in store.env_keys.keys() {
             assert_ne!(k, "rf_live_plaintextkey");
         }
+    }
+
+    // ── DB layer ────────────────────────────────────────────────────────────
+
+    fn db_record(name: &str, active: bool) -> DbKeyRecord {
+        DbKeyRecord {
+            client_name: name.to_string(),
+            active,
+        }
+    }
+
+    #[test]
+    fn db_key_validates_without_being_in_env() {
+        // The whole point of the feature: a key provisioned by an external
+        // app, never present in ROUTERFUEL_API_KEYS, authenticates.
+        let store = ApiKeyStore::from_env_string("");
+        let hash = sha256_hex("rf_live_provisioned");
+
+        store.replace_db_keys(HashMap::from([(
+            hash.clone(),
+            db_record("NewSignup", true),
+        )]));
+
+        assert_eq!(
+            store.validate("rf_live_provisioned"),
+            Some((hash, "NewSignup".to_string()))
+        );
+    }
+
+    #[test]
+    fn inactive_db_key_is_rejected() {
+        let store = ApiKeyStore::from_env_string("");
+        let hash = sha256_hex("rf_live_revoked");
+
+        store.replace_db_keys(HashMap::from([(
+            hash,
+            db_record("Revoked", false),
+        )]));
+
+        assert!(store.validate("rf_live_revoked").is_none());
+    }
+
+    #[test]
+    fn inactive_db_key_shadows_env_key() {
+        // Revocation must be enforceable even for a key that is also listed
+        // in ROUTERFUEL_API_KEYS — otherwise `active = false` is a no-op for
+        // exactly the keys most likely to be in both places.
+        let store = store_with("rf_live_both", "EnvName");
+        let hash = sha256_hex("rf_live_both");
+
+        store.replace_db_keys(HashMap::from([(
+            hash,
+            db_record("DbName", false),
+        )]));
+
+        assert!(store.validate("rf_live_both").is_none());
+    }
+
+    #[test]
+    fn db_name_wins_over_env_name_for_same_key() {
+        let store = store_with("rf_live_both", "EnvName");
+        let hash = sha256_hex("rf_live_both");
+
+        store.replace_db_keys(HashMap::from([(
+            hash.clone(),
+            db_record("DbName", true),
+        )]));
+
+        assert_eq!(
+            store.validate("rf_live_both"),
+            Some((hash, "DbName".to_string()))
+        );
+    }
+
+    #[test]
+    fn env_key_still_works_when_db_layer_is_empty() {
+        // Break-glass path: DB unreachable / sync never succeeded.
+        let store = store_with("rf_live_breakglass", "Operator");
+        let hash = sha256_hex("rf_live_breakglass");
+        assert!(store.db_active_len() == 0);
+        assert_eq!(
+            store.validate("rf_live_breakglass"),
+            Some((hash, "Operator".to_string()))
+        );
+    }
+
+    #[test]
+    fn replace_db_keys_removes_keys_absent_from_the_new_snapshot() {
+        // Snapshot semantics: a DELETEd row disappears on the next sync
+        // rather than lingering forever.
+        let store = ApiKeyStore::from_env_string("");
+        let hash = sha256_hex("rf_live_deleted");
+
+        store.replace_db_keys(HashMap::from([(
+            hash,
+            db_record("Deleted", true),
+        )]));
+        assert!(store.validate("rf_live_deleted").is_some());
+
+        store.replace_db_keys(HashMap::new());
+        assert!(store.validate("rf_live_deleted").is_none());
+        assert_eq!(store.db_active_len(), 0);
     }
 
     #[test]

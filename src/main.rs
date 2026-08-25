@@ -1077,9 +1077,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL environment variable not set");
 
-    let routerfuel_keys_raw = std::env::var("ROUTERFUEL_API_KEYS").unwrap_or_default();
-    let api_key_store = Arc::new(ApiKeyStore::from_env_string(&routerfuel_keys_raw));
-
     info!("Configuration loaded from environment");
 
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -1098,8 +1095,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cost_tracker = Arc::new(CostTracker::new(pool.clone()));
     let rate_limiter = Arc::new(RateLimiter::new());
 
+    // The auth store is built here rather than before the pool because its
+    // primary layer is the `client_tiers` table — ROUTERFUEL_API_KEYS is now
+    // the fallback / break-glass layer. See auth.rs's header for lookup order.
+    let routerfuel_keys_raw = std::env::var("ROUTERFUEL_API_KEYS").unwrap_or_default();
+    let api_key_store = Arc::new(ApiKeyStore::from_env_string(&routerfuel_keys_raw));
+
     let client_tiers_raw = std::env::var("ROUTERFUEL_CLIENT_TIERS").unwrap_or_default();
-    client_registry::load_all_tiers(&pool, &rate_limiter, &client_tiers_raw, TierConfig::PRO).await;
+    client_registry::load_all_tiers(
+        &pool,
+        &api_key_store,
+        &rate_limiter,
+        &client_tiers_raw,
+        TierConfig::PRO,
+    )
+    .await;
+
+    // Recurring sync — this is what lets an external app provision keys and
+    // change tiers without a restart.
+    let client_sync_secs: u64 = std::env::var("ROUTERFUEL_CLIENT_SYNC_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(client_registry::DEFAULT_SYNC_INTERVAL_SECS);
+
+    client_registry::spawn_client_sync_task(
+        pool.clone(),
+        Arc::clone(&api_key_store),
+        Arc::clone(&rate_limiter),
+        std::time::Duration::from_secs(client_sync_secs),
+    );
+
+    info!(
+        client_sync_secs,
+        env_keys = api_key_store.len(),
+        db_keys_active = api_key_store.db_active_len(),
+        "Client auth/tier sync active — client_tiers changes apply without a restart"
+    );
 
     let loop_repeat_threshold: usize = std::env::var("LOOP_GUARD_REPEAT_THRESHOLD")
         .ok()
