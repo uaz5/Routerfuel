@@ -114,6 +114,229 @@ impl std::str::FromStr for MeetingTask {
     }
 }
 
+// ============================================================================
+// REQUEST CLASSIFICATION FOR "auto" ROUTING
+//
+// Two axes, both feeding the *existing* scored path rather than a parallel
+// one: classification's whole output is which `RoutingPriority` and which
+// `SelectionLimits` get handed to `select_filtered` — the same function
+// every other route already goes through.
+// ============================================================================
+
+/// Coarse task buckets for `model: "auto"` requests.
+///
+/// Deliberately only two. `ModelConfig` has no per-model task-suitability
+/// field (`supports_vision` is the only capability flag), so `Code` is the
+/// one bucket with genuinely distinct targets in the registry —
+/// `grok-code-fast-1` and `codestral-2`. A `Creative` bucket was considered
+/// and dropped: nothing in the registry serves it differently from
+/// `General`, so it would have detected poorly and then routed identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Code,
+    General,
+}
+
+/// How much model the request looks like it needs.
+///
+/// Only `Simple` changes routing today — it downgrades to
+/// `RoutingPriority::Cost` behind a quality floor and a price ceiling
+/// (see `SelectionLimits::simple`). `Moderate` and `Complex`
+/// both map to `Balanced`, which is exactly what `"auto"` did before
+/// classification existed, so this can never make a request more expensive
+/// than it already was. `Complex` is still computed and reported (see the
+/// annotated `RoutingDecision::reason`) so there's real traffic data behind
+/// any later decision to escalate it to `Quality`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Difficulty {
+    Simple,
+    Moderate,
+    Complex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestShape {
+    pub task: TaskKind,
+    pub difficulty: Difficulty,
+}
+
+impl RequestShape {
+    pub fn priority(&self) -> RoutingPriority {
+        match self.difficulty {
+            Difficulty::Simple => RoutingPriority::Cost,
+            // Unchanged from the pre-classification default. See Difficulty.
+            Difficulty::Moderate | Difficulty::Complex => RoutingPriority::Balanced,
+        }
+    }
+}
+
+// The bias is deliberately toward "not simple": a request wrongly called
+// simple gets a weak answer, while one wrongly called complex only costs
+// more. So `Simple` requires *every* condition to hold, while `Complex`
+// needs only one.
+const SIMPLE_MAX_INPUT_TOKENS: u32 = 500;
+const SIMPLE_MAX_OUTPUT_TOKENS: u32 = 512;
+const COMPLEX_MIN_INPUT_TOKENS: u32 = 4_000;
+const COMPLEX_MIN_OUTPUT_TOKENS: u32 = 2_000;
+const COMPLEX_MIN_MESSAGES: usize = 6;
+
+/// Quality floor for the `Simple` path — stops a cheap-but-weak model from
+/// capturing simple traffic. Never allowed to fail a request; see
+/// `select_for_shape`.
+const SIMPLE_MIN_QUALITY: f32 = 0.60;
+
+/// Price ceiling for the `Simple` path, in cents per 1M tokens, applied to
+/// `cost_per_1m_input + cost_per_1m_output`.
+///
+/// This is load-bearing, not insurance — without it the simple path does
+/// not actually route to a cheap model. `RoutingPriority::Cost` alone is
+/// not enough, because `s_cost` is `1/(1 + cost/10)`: on a 300-input /
+/// 256-output request every candidate costs between 0.006c and 0.09c, so
+/// s_cost only spans 0.9909..0.9994. That 0.0085 spread times the 0.60 cost
+/// weight is ~0.005 of final score, while the quality spread (0.58..0.85)
+/// times the 0.20 quality weight is ~0.054 — an order of magnitude more.
+/// Cost weighting therefore ranks by *quality* on precisely the small
+/// requests we want to cheapen, and only starts behaving like its name at
+/// around 1 cent per request. Measured: without this ceiling, a simple
+/// request picks gemini-3-flash (50+300 = 350 blended) over
+/// deepseek-v4-flash (14+28 = 42) — an 8x price difference in the wrong
+/// direction.
+///
+/// 60 admits the flash-lite / small-model tier and excludes the mid-tier
+/// flash and code models. Like the floor, it never fails a request.
+const SIMPLE_MAX_BLENDED_COST_PER_1M: f64 = 60.0;
+
+/// Optional pre-filters applied before the weighted comparison in
+/// `select_filtered`. Grouped into a struct rather than added as loose
+/// parameters so the selection signature stays readable as policy knobs
+/// accumulate. `Default` is "no limits", i.e. exactly what every caller
+/// before shape-based routing did.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelectionLimits {
+    pub min_quality: Option<f32>,
+    /// Ceiling on `cost_per_1m_input + cost_per_1m_output`, in cents.
+    pub max_blended_cost_per_1m: Option<f64>,
+}
+
+impl SelectionLimits {
+    /// The limits that define "cheap, fast, general" for the simple path.
+    fn simple() -> Self {
+        Self {
+            min_quality: Some(SIMPLE_MIN_QUALITY),
+            max_blended_cost_per_1m: Some(SIMPLE_MAX_BLENDED_COST_PER_1M),
+        }
+    }
+}
+
+/// Cheap, code-tuned models preferred for `Simple` + `Code`, in order.
+/// A short explicit list rather than a scored field, for the same reason
+/// `select_for_task` keeps a preferred-model fast path: these are the only
+/// registry entries with a real task specialization, and inventing a
+/// `code_score` for all ~45 curated entries (plus a default for the ~300
+/// OpenRouter catalog entries merged at startup) would be far more invented
+/// numbers than this earns.
+const SIMPLE_CODE_MODELS: &[&str] = &["grok-code-fast-1", "codestral-2"];
+
+/// Substrings that mark a request as coding work. Matched case-insensitively.
+///
+/// Precision matters much less here than it appears: `TaskKind::Code` only
+/// changes routing when the request is *also* `Difficulty::Simple`, where
+/// the choice is between two cheap fast models. A false positive swaps
+/// gemini-3.1-flash-lite for grok-code-fast-1 and costs nothing meaningful;
+/// task type has no effect at all on Moderate/Complex routing.
+const CODE_MARKERS: &[&str] = &[
+    "```",
+    "def ",
+    "fn ",
+    "func ",
+    "function ",
+    "import ",
+    "#include",
+    "public static",
+    "let mut ",
+    "traceback",
+    "stack trace",
+    "stacktrace",
+    "segmentation fault",
+    "null pointer",
+    "compile error",
+    "syntax error",
+    "unit test",
+    "refactor",
+    "npm ",
+    "cargo ",
+    "git commit",
+    "dockerfile",
+    ".py",
+    ".rs",
+    ".ts",
+    ".js",
+    ".java",
+    ".cpp",
+    ".sql",
+];
+
+/// Classifies an incoming `"auto"` request along both axes using only data
+/// the request path has already computed — no extra provider call. A
+/// pre-flight classification call was considered and rejected: every call
+/// here is BYOK-billed to the client and reserved through SpendGuard, so it
+/// would double the request count and need its own key selection and spend
+/// accounting just to decide a request was cheap.
+///
+/// `max_output_tokens` is the client's `max_tokens` *as supplied*. `None`
+/// deliberately reads as "no signal" — it neither blocks `Simple` nor
+/// triggers `Complex`. Passing the resolved default (1024) instead would
+/// mean no request that omits `max_tokens` could ever be `Simple`, which is
+/// most of them.
+pub fn classify(
+    messages: &[crate::connectors::ChatMessage],
+    input_tokens: u32,
+    max_output_tokens: Option<u32>,
+    has_image: bool,
+) -> RequestShape {
+    let task = if messages.iter().any(|m| {
+        let text = m.content.as_text().to_lowercase();
+        CODE_MARKERS.iter().any(|marker| text.contains(marker))
+    }) {
+        TaskKind::Code
+    } else {
+        TaskKind::General
+    };
+
+    // A system prompt alongside one user turn is still a single-shot
+    // request, so count user turns rather than total messages here.
+    let user_turns = messages.iter().filter(|m| m.role == "user").count();
+
+    let output_is_small = max_output_tokens.map_or(true, |n| n <= SIMPLE_MAX_OUTPUT_TOKENS);
+    let output_is_large = max_output_tokens.map_or(false, |n| n > COMPLEX_MIN_OUTPUT_TOKENS);
+
+    let difficulty = if input_tokens < SIMPLE_MAX_INPUT_TOKENS
+        && output_is_small
+        && user_turns <= 1
+        && !has_image
+    {
+        Difficulty::Simple
+    } else if input_tokens > COMPLEX_MIN_INPUT_TOKENS
+        || output_is_large
+        || messages.len() > COMPLEX_MIN_MESSAGES
+    {
+        Difficulty::Complex
+    } else {
+        Difficulty::Moderate
+    };
+
+    RequestShape { task, difficulty }
+}
+
+/// Appends the classification to a routing reason string. `reason` is
+/// already the carrier for "why this model" — it's logged, stored on
+/// `RoutingDecision`, and surfaced by the admin dashboard — so the
+/// classification rides along there instead of needing a new field
+/// threaded through the request path.
+fn annotate_reason(reason: &str, shape: RequestShape) -> String {
+    format!("{} [task={:?}, difficulty={:?}]", reason, shape.task, shape.difficulty)
+}
+
 pub struct RouteEngine {
     models: RwLock<Vec<ModelConfig>>,
 }
@@ -445,6 +668,32 @@ impl RouteEngine {
         priority: RoutingPriority,
         reachable: Option<&HashSet<Provider>>,
     ) -> Result<RoutingDecision> {
+        self.select_filtered(
+            input_tokens,
+            max_output_tokens,
+            priority,
+            reachable,
+            SelectionLimits::default(),
+        )
+    }
+
+    /// Same as `select_reachable`, plus `limits` — optional quality-floor
+    /// and price-ceiling pre-filters applied before the weighted comparison.
+    ///
+    /// Layered underneath `select_reachable` (which is itself what `select`
+    /// delegates to) so limits are purely additive: every existing caller
+    /// keeps its current behaviour via `SelectionLimits::default()`. The
+    /// only caller that sets limits today is `select_for_shape`'s simple
+    /// path.
+    #[instrument(skip(self, reachable))]
+    pub fn select_filtered(
+        &self,
+        input_tokens: u32,
+        max_output_tokens: u32,
+        priority: RoutingPriority,
+        reachable: Option<&HashSet<Provider>>,
+        limits: SelectionLimits,
+    ) -> Result<RoutingDecision> {
         let models = self.models.read();
 
         // Weight tuples: (cost, latency, quality, context_headroom)
@@ -467,6 +716,21 @@ impl RouteEngine {
             if input_tokens >= m.context_window {
                 debug!(model = %m.api_id, "Skipped — context overflow");
                 continue;
+            }
+
+            if let Some(floor) = limits.min_quality {
+                if m.quality_score < floor {
+                    debug!(model = %m.api_id, floor, "Skipped — below min_quality floor");
+                    continue;
+                }
+            }
+
+            if let Some(ceiling) = limits.max_blended_cost_per_1m {
+                let blended = m.cost_per_1m_input + m.cost_per_1m_output;
+                if blended > ceiling {
+                    debug!(model = %m.api_id, blended, ceiling, "Skipped — above price ceiling");
+                    continue;
+                }
             }
 
             let cost = (input_tokens as f64 / 1_000_000.0) * m.cost_per_1m_input
@@ -496,6 +760,79 @@ impl RouteEngine {
         );
         info!("{}", reason);
         Ok(RoutingDecision { model, score, reason })
+    }
+
+    // ===================================================================
+    // SHAPE-BASED ROUTING  (for "auto" requests)
+    // ===================================================================
+
+    /// Routes an `"auto"` request from its classified shape.
+    ///
+    /// This is an extension of the scored path, not an alternative to it:
+    /// for everything except `Difficulty::Simple` it calls exactly the same
+    /// `select_reachable` with exactly the same `Balanced` priority that
+    /// `"auto"` used before classification existed, so those requests are
+    /// bit-for-bit unchanged. `Simple` is the only new behaviour — it swaps
+    /// in `RoutingPriority::Cost` plus `SelectionLimits::simple`.
+    pub fn select_for_shape(
+        &self,
+        shape: RequestShape,
+        input_tokens: u32,
+        max_output_tokens: u32,
+        reachable: Option<&HashSet<Provider>>,
+    ) -> Result<RoutingDecision> {
+        let priority = shape.priority();
+
+        if shape.difficulty != Difficulty::Simple {
+            let mut decision =
+                self.select_reachable(input_tokens, max_output_tokens, priority, reachable)?;
+            decision.reason = annotate_reason(&decision.reason, shape);
+            return Ok(decision);
+        }
+
+        // Simple + Code: prefer a cheap code-tuned model the client can
+        // actually reach, same preferred-model-then-fall-back-to-scoring
+        // shape as select_for_task.
+        if shape.task == TaskKind::Code {
+            for preferred in SIMPLE_CODE_MODELS {
+                if let Ok(m) = self.find(preferred) {
+                    let is_reachable = reachable.map_or(true, |r| r.contains(&m.provider));
+                    if m.enabled && is_reachable && input_tokens < m.context_window {
+                        let reason = format!(
+                            "{} chosen as cheap code-tuned model [task=Code, difficulty=Simple]",
+                            m.display_name
+                        );
+                        info!("{}", reason);
+                        return Ok(RoutingDecision { model: m, score: 1.0, reason });
+                    }
+                }
+            }
+        }
+
+        // Simple + General — and Simple + Code where no code-tuned model was
+        // reachable: best-scoring thing inside the cheap tier.
+        let mut decision = match self.select_filtered(
+            input_tokens,
+            max_output_tokens,
+            priority,
+            reachable,
+            SelectionLimits::simple(),
+        ) {
+            Ok(d) => d,
+            // The limits express a preference, not a requirement — they must
+            // never be the reason a request fails. Retry unrestricted before
+            // giving up, so a client whose only reachable models are pricey
+            // or weak still gets served.
+            Err(_) => {
+                debug!(
+                    "no reachable model satisfied the simple-path limits — retrying without them"
+                );
+                self.select_reachable(input_tokens, max_output_tokens, priority, reachable)?
+            }
+        };
+
+        decision.reason = annotate_reason(&decision.reason, shape);
+        Ok(decision)
     }
 
     // ===================================================================
@@ -802,6 +1139,207 @@ mod tests {
         assert_eq!(grok.provider, Provider::XAI);
         assert_eq!(grok.context_window, 500_000);
         assert_eq!(e.get_pricing("grok-4.6").unwrap(), (200.0, 600.0));
+    }
+
+    fn msg(role: &str, text: &str) -> crate::connectors::ChatMessage {
+        crate::connectors::ChatMessage {
+            role: role.to_string(),
+            content: crate::vision::MessageContent::Text(text.to_string()),
+        }
+    }
+
+    #[test]
+    fn short_single_turn_prompt_is_simple() {
+        let m = vec![msg("user", "What is the capital of France?")];
+        let shape = classify(&m, 30, Some(256), false);
+        assert_eq!(shape.difficulty, Difficulty::Simple);
+        assert_eq!(shape.task, TaskKind::General);
+        assert!(matches!(shape.priority(), RoutingPriority::Cost));
+    }
+
+    #[test]
+    fn omitted_max_tokens_does_not_block_simple() {
+        // The resolved default is 1024, above SIMPLE_MAX_OUTPUT_TOKENS — if
+        // classify saw that instead of None, almost nothing would ever be
+        // Simple, since most clients omit max_tokens.
+        let m = vec![msg("user", "Hi")];
+        assert_eq!(classify(&m, 10, None, false).difficulty, Difficulty::Simple);
+    }
+
+    #[test]
+    fn long_input_is_complex() {
+        let m = vec![msg("user", "summarise this")];
+        assert_eq!(classify(&m, 50_000, Some(256), false).difficulty, Difficulty::Complex);
+    }
+
+    #[test]
+    fn large_requested_output_is_complex() {
+        let m = vec![msg("user", "write me something long")];
+        assert_eq!(classify(&m, 20, Some(8_000), false).difficulty, Difficulty::Complex);
+    }
+
+    #[test]
+    fn deep_multi_turn_is_complex() {
+        let m: Vec<_> = (0..8).map(|_| msg("user", "and then?")).collect();
+        assert_eq!(classify(&m, 100, Some(256), false).difficulty, Difficulty::Complex);
+    }
+
+    #[test]
+    fn mid_sized_request_is_moderate_and_keeps_todays_priority() {
+        let m = vec![msg("user", "a somewhat longer question")];
+        let shape = classify(&m, 2_000, Some(1024), false);
+        assert_eq!(shape.difficulty, Difficulty::Moderate);
+        assert!(matches!(shape.priority(), RoutingPriority::Balanced));
+    }
+
+    #[test]
+    fn system_prompt_does_not_disqualify_simple() {
+        let m = vec![msg("system", "You are terse."), msg("user", "2+2?")];
+        assert_eq!(classify(&m, 40, Some(64), false).difficulty, Difficulty::Simple);
+    }
+
+    #[test]
+    fn image_request_is_never_simple() {
+        let m = vec![msg("user", "what is this?")];
+        assert_ne!(classify(&m, 20, Some(64), true).difficulty, Difficulty::Simple);
+    }
+
+    #[test]
+    fn code_prompts_classify_as_code() {
+        let fenced = vec![msg("user", "fix this:\n```\nlet x = 1\n```")];
+        assert_eq!(classify(&fenced, 40, Some(256), false).task, TaskKind::Code);
+
+        let traceback = vec![msg("user", "got a Traceback from my script")];
+        assert_eq!(classify(&traceback, 40, Some(256), false).task, TaskKind::Code);
+
+        let prose = vec![msg("user", "Who won the 1998 world cup?")];
+        assert_eq!(classify(&prose, 40, Some(256), false).task, TaskKind::General);
+    }
+
+    #[test]
+    fn simple_general_routes_within_the_cheap_tier() {
+        let e = RouteEngine::new();
+        let shape = RequestShape { task: TaskKind::General, difficulty: Difficulty::Simple };
+        let d = e.select_for_shape(shape, 300, 256, None).unwrap();
+
+        let blended = d.model.cost_per_1m_input + d.model.cost_per_1m_output;
+        assert!(
+            blended <= SIMPLE_MAX_BLENDED_COST_PER_1M,
+            "picked {} at {} blended", d.model.api_id, blended
+        );
+        assert!(d.model.quality_score >= SIMPLE_MIN_QUALITY);
+        assert!(d.reason.contains("difficulty=Simple"), "reason was: {}", d.reason);
+    }
+
+    #[test]
+    fn simple_path_is_cheaper_than_the_priority_alone_would_pick() {
+        // Regression guard for the reason the price ceiling exists at all:
+        // s_cost saturates on small requests, so Cost weighting on its own
+        // ranks by quality and picks a mid-tier model. If someone deletes
+        // the ceiling believing the priority is sufficient, this fails.
+        let e = RouteEngine::new();
+        let shape = RequestShape { task: TaskKind::General, difficulty: Difficulty::Simple };
+        let with_limits = e.select_for_shape(shape, 300, 256, None).unwrap();
+        let priority_only = e
+            .select_reachable(300, 256, RoutingPriority::Cost, None)
+            .unwrap();
+
+        let blended = |m: &ModelConfig| m.cost_per_1m_input + m.cost_per_1m_output;
+        assert!(
+            blended(&with_limits.model) < blended(&priority_only.model),
+            "limits picked {} ({}) but Cost priority alone picked {} ({})",
+            with_limits.model.api_id, blended(&with_limits.model),
+            priority_only.model.api_id, blended(&priority_only.model),
+        );
+    }
+
+    #[test]
+    fn simple_code_prefers_a_code_tuned_model() {
+        let e = RouteEngine::new();
+        let shape = RequestShape { task: TaskKind::Code, difficulty: Difficulty::Simple };
+        let d = e.select_for_shape(shape, 300, 256, None).unwrap();
+        assert!(
+            SIMPLE_CODE_MODELS.contains(&d.model.api_id.as_str()),
+            "expected a code-tuned model, got {}", d.model.api_id
+        );
+    }
+
+    #[test]
+    fn simple_code_falls_back_when_no_code_model_is_reachable() {
+        let e = RouteEngine::new();
+        // grok-code-fast-1 is xAI and codestral-2 is Mistral — allow neither.
+        let mut only_gemini = HashSet::new();
+        only_gemini.insert(Provider::Gemini);
+        let shape = RequestShape { task: TaskKind::Code, difficulty: Difficulty::Simple };
+        let d = e.select_for_shape(shape, 300, 256, Some(&only_gemini)).unwrap();
+        assert_eq!(d.model.provider, Provider::Gemini);
+    }
+
+    #[test]
+    fn non_simple_shapes_route_identically_to_the_old_auto_default() {
+        // The guarantee that adding classification cannot make any
+        // previously-served request more expensive.
+        let e = RouteEngine::new();
+        for difficulty in [Difficulty::Moderate, Difficulty::Complex] {
+            for task in [TaskKind::General, TaskKind::Code] {
+                let shape = RequestShape { task, difficulty };
+                let via_shape = e.select_for_shape(shape, 50_000, 1024, None).unwrap();
+                let via_old = e
+                    .select_reachable(50_000, 1024, RoutingPriority::Balanced, None)
+                    .unwrap();
+                assert_eq!(
+                    via_shape.model.api_id, via_old.model.api_id,
+                    "{difficulty:?}/{task:?} diverged from the Balanced default"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn min_quality_floor_excludes_weak_models() {
+        let e = RouteEngine::new();
+        let limits = SelectionLimits { min_quality: Some(0.95), ..Default::default() };
+        let d = e
+            .select_filtered(1_000, 256, RoutingPriority::Cost, None, limits)
+            .unwrap();
+        assert!(d.model.quality_score >= 0.95, "picked {}", d.model.api_id);
+
+        // Unfloored, the same Cost-weighted query picks something weaker —
+        // proving the floor is what changed the outcome.
+        let unfloored = e.select_reachable(1_000, 256, RoutingPriority::Cost, None).unwrap();
+        assert!(unfloored.model.quality_score < 0.95);
+    }
+
+    #[test]
+    fn price_ceiling_excludes_expensive_models() {
+        let e = RouteEngine::new();
+        let limits = SelectionLimits { max_blended_cost_per_1m: Some(60.0), ..Default::default() };
+        let d = e
+            .select_filtered(300, 256, RoutingPriority::Quality, None, limits)
+            .unwrap();
+        assert!(d.model.cost_per_1m_input + d.model.cost_per_1m_output <= 60.0);
+
+        // Quality priority uncapped goes straight to a flagship.
+        let uncapped = e.select_reachable(300, 256, RoutingPriority::Quality, None).unwrap();
+        assert!(uncapped.model.cost_per_1m_input + uncapped.model.cost_per_1m_output > 60.0);
+    }
+
+    #[test]
+    fn unsatisfiable_limits_still_serve_the_request() {
+        // select_filtered itself fails when nothing clears the limits...
+        let e = RouteEngine::new();
+        let impossible = SelectionLimits { min_quality: Some(1.5), ..Default::default() };
+        assert!(e
+            .select_filtered(1_000, 256, RoutingPriority::Cost, None, impossible)
+            .is_err());
+
+        // ...but the simple path must never fail for that reason. Restrict
+        // to a provider whose cheapest model sits below SIMPLE_MIN_QUALITY
+        // and confirm a decision still comes back.
+        let mut only_mistral = HashSet::new();
+        only_mistral.insert(Provider::Mistral);
+        let shape = RequestShape { task: TaskKind::General, difficulty: Difficulty::Simple };
+        assert!(e.select_for_shape(shape, 300, 256, Some(&only_mistral)).is_ok());
     }
 
     #[test]

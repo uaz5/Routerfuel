@@ -374,12 +374,32 @@ fn resolve_model(
 
     if request.model == "auto" {
         let decision = if has_image {
+            // Vision keeps precedence: an image request needs a
+            // vision-capable model however simple it looks. classify()
+            // independently refuses to call an image request Simple, so
+            // these two rules agree rather than race.
             crate::vision::select_vision_model(&state.route_engine, input_tokens, RoutingPriority::Balanced, reachable.as_ref())
                 .map_err(|e| ApiError::ProviderError(format!("No vision-capable provider available: {e}")))?
         } else {
+            // Classify along task type + difficulty, then hand the result
+            // to the same scored path "auto" always used. Note classify()
+            // gets `request.max_tokens` unresolved — a client that omits it
+            // must not be treated as if it had asked for 1024 output
+            // tokens, or nothing would ever classify as Simple.
+            let shape = crate::route_engine::classify(
+                &request.messages,
+                input_tokens,
+                request.max_tokens,
+                has_image,
+            );
+            info!(
+                task = ?shape.task,
+                difficulty = ?shape.difficulty,
+                "Classified \"auto\" request"
+            );
             state
                 .route_engine
-                .select_reachable(input_tokens, request.max_tokens.unwrap_or(1024), RoutingPriority::Balanced, reachable.as_ref())
+                .select_for_shape(shape, input_tokens, request.max_tokens.unwrap_or(1024), reachable.as_ref())
                 .map_err(|e| ApiError::ProviderError(format!("No available providers: {e}")))?
         };
         return Ok((decision.model.provider, decision.model.api_id));
