@@ -196,8 +196,15 @@ impl RouteEngine {
                 cost_in: 100.0, cost_out: 500.0, latency_ms: 90, quality: 0.80, context: 200_000,
                 vision: true, open_weight: false, enabled: true),
 
-            model!(api_id: "claude-fable-5", display_name: "Claude Fable 5", provider: Provider::Anthropic,
+            // 5.1 takes over 0.99 as Anthropic's top entry and claude-fable-5
+            // steps down to 0.98 (below), so the two rank on quality outright
+            // rather than tying and falling through to registry order.
+            model!(api_id: "claude-fable-5-1", display_name: "Claude Fable 5.1", provider: Provider::Anthropic,
                 cost_in: 1000.0, cost_out: 5000.0, latency_ms: 320, quality: 0.99, context: 1_000_000,
+                vision: true, open_weight: false, enabled: true),
+
+            model!(api_id: "claude-fable-5", display_name: "Claude Fable 5", provider: Provider::Anthropic,
+                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 320, quality: 0.98, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "claude-opus-4-7", display_name: "Claude Opus 4.7", provider: Provider::Anthropic,
@@ -280,6 +287,14 @@ impl RouteEngine {
             // xAI GROK — POST https://api.x.ai/v1/chat/completions
             // OpenAI-compatible schema
             // ================================================================
+            // 500k context is a step *down* from grok-4.5/4.20's 2M, so
+            // inputs above 500k tokens fall through to the older Groks
+            // rather than to this one — that's the context filter in
+            // select_reachable working as intended, not a misconfiguration.
+            model!(api_id: "grok-4.6", display_name: "Grok 4.6", provider: Provider::XAI,
+                cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.96, context: 500_000,
+                vision: true, open_weight: false, enabled: true),
+
             model!(api_id: "grok-4.5", display_name: "Grok 4.5", provider: Provider::XAI,
                 cost_in: 200.0, cost_out: 600.0, latency_ms: 190, quality: 0.93, context: 2_000_000,
                 vision: true, open_weight: false, enabled: true),
@@ -630,6 +645,20 @@ impl RouteEngine {
 pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
     match direct_api_id {
         "gemini-3-flash" => Some("google/gemini-3-flash-preview"),
+        // Anthropic's own API ids dash-separate the minor version
+        // ("claude-fable-5-1"), but OpenRouter's slug keeps the dot
+        // ("anthropic/claude-fable-5.1"), so resolve_byok_route's
+        // "{prefix}/{model}" formula guesses "anthropic/claude-fable-5-1" —
+        // a slug that does not exist in OpenRouter's catalog. Same class of
+        // mismatch as gemini-3-flash above.
+        //
+        // Note this is specific to the dotted minor version: plain
+        // "claude-fable-5" needs no entry, because the formula's
+        // "anthropic/claude-fable-5" is already OpenRouter's real slug.
+        // grok-4.6 needs no entry either — its direct api_id already
+        // carries the dot, so the formula yields the correct
+        // "x-ai/grok-4.6".
+        "claude-fable-5-1" => Some("anthropic/claude-fable-5.1"),
         _ => None,
     }
 }
@@ -754,5 +783,40 @@ mod tests {
     fn byok_bedrock_rejected_without_header() {
         let e = RouteEngine::new();
         assert!(e.select_provider("any-model-name", false, false).is_err());
+    }
+
+    #[test]
+    fn fable_5_1_and_grok_4_6_are_registered() {
+        let e = RouteEngine::new();
+
+        let fable = e.find("claude-fable-5-1").unwrap();
+        assert_eq!(fable.provider, Provider::Anthropic);
+        assert_eq!(fable.context_window, 1_000_000);
+        assert_eq!(e.get_pricing("claude-fable-5-1").unwrap(), (1000.0, 5000.0));
+
+        // 5.1 must outrank plain Fable 5 on quality outright, so Quality-priority
+        // routing never depends on which one happens to come first in the vec.
+        assert!(fable.quality_score > e.find("claude-fable-5").unwrap().quality_score);
+
+        let grok = e.find("grok-4.6").unwrap();
+        assert_eq!(grok.provider, Provider::XAI);
+        assert_eq!(grok.context_window, 500_000);
+        assert_eq!(e.get_pricing("grok-4.6").unwrap(), (200.0, 600.0));
+    }
+
+    #[test]
+    fn anthropic_dotted_minor_version_needs_a_slug_override() {
+        // The "{prefix}/{model}" formula would guess
+        // "anthropic/claude-fable-5-1", which OpenRouter does not carry.
+        assert_eq!(
+            openrouter_slug_override("claude-fable-5-1"),
+            Some("anthropic/claude-fable-5.1")
+        );
+
+        // These two the formula already gets right, so they must stay
+        // un-overridden — an entry here would be dead weight at best and
+        // wrong the day OpenRouter renames something.
+        assert_eq!(openrouter_slug_override("grok-4.6"), None);
+        assert_eq!(openrouter_slug_override("claude-fable-5"), None);
     }
 }
