@@ -17,6 +17,7 @@ mod openrouter_catalog;
 mod rate_limiter;
 mod route_engine;
 mod semantic_cache;
+mod supercompress;
 mod streaming;
 mod telemetry;
 mod tokens;
@@ -265,7 +266,7 @@ async fn chat_completions_handler(
 /// passes spend_guard/rl_key/estimated_cost through so streaming.rs can
 /// reconcile (or release) it once real usage — or a failure — is known.
 /// Previously this path never recorded spend at all.
-async fn handle_streaming(headers: HeaderMap, state: AppState, request: ChatCompletionRequest) -> Response {
+async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: ChatCompletionRequest) -> Response {
     let request_id = Uuid::new_v4().to_string();
     let client_id = headers
         .get("x-routerfuel-client-id")
@@ -313,6 +314,30 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, request: ChatComp
             return ApiError::InternalError("Pricing lookup failed".to_string()).into_response();
         }
     };
+    // Supercompress (Tier 1, lossless) runs *after* routing on purpose: the
+    // saving is only meaningful against the target model's own input rate,
+    // and classification must read the original prompt rather than our
+    // artifact (otherwise compression and the Simple downgrade would stack
+    // two quality reductions from one decision).
+    let sc_opts = request.supercompress.unwrap_or_default();
+    let sc_mode = supercompress::server_mode();
+    let (sc_messages, sc_report) =
+        supercompress::compress(&request.messages, sc_opts, input_tokens, sc_mode);
+    supercompress::log_audit(
+        &request_id,
+        &routing_model_id,
+        cost_per_1m_input,
+        &sc_report,
+        sc_mode,
+    );
+    let input_tokens = match sc_messages {
+        Some(messages) => {
+            request.messages = messages;
+            sc_report.compressed_tokens
+        }
+        None => input_tokens,
+    };
+
     let estimated_output = tokens::estimate_output_tokens(request.max_tokens, &request.model);
     let estimated_cost = TokenCostBreakdown::new(input_tokens, estimated_output, cost_per_1m_input, cost_per_1m_output);
 
@@ -462,7 +487,7 @@ fn resolve_model(
 async fn handle_non_streaming(
     headers: HeaderMap,
     state: AppState,
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let request_id = Uuid::new_v4().to_string();
     tracing::Span::current().record("request_id", &request_id);
@@ -612,6 +637,30 @@ async fn handle_non_streaming(
             error!("Pricing lookup failed: {}", e);
             return Err(ApiError::InternalError("Pricing lookup failed".to_string()));
         }
+    };
+
+    // See the matching block in handle_streaming for why compression runs
+    // here — after routing, before the spend reservation. This path also
+    // does a semantic-cache lookup, and that happens further up, so cache
+    // keys stay on the original prompt text and a cache hit never pays for
+    // compression.
+    let sc_opts = request.supercompress.unwrap_or_default();
+    let sc_mode = supercompress::server_mode();
+    let (sc_messages, sc_report) =
+        supercompress::compress(&request.messages, sc_opts, input_tokens, sc_mode);
+    supercompress::log_audit(
+        &request_id,
+        &routing_model_id,
+        cost_per_1m_input,
+        &sc_report,
+        sc_mode,
+    );
+    let input_tokens = match sc_messages {
+        Some(messages) => {
+            request.messages = messages;
+            sc_report.compressed_tokens
+        }
+        None => input_tokens,
     };
 
     let estimated_cost = TokenCostBreakdown::new(

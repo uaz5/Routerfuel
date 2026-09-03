@@ -165,6 +165,12 @@ pub struct ChatCompletionRequest {
     /// See main.rs's `maybe_fire_shadow_request` and CHANGES.md for details.
     #[serde(skip_serializing, default)]
     pub shadow_model: Option<String>,
+    /// RouterFuel-only field, never forwarded to a provider — controls
+    /// prompt compression before the request is sent. Absent means Tier 1
+    /// defaults (lossless whitespace normalization + exact-duplicate
+    /// dedup, both on). See src/supercompress.rs.
+    #[serde(skip_serializing, default)]
+    pub supercompress: Option<crate::supercompress::SupercompressOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -87,6 +87,7 @@ Migrations run automatically on startup too, via `sqlx::migrate!` in `main.rs`.
 | `ROUTERFUEL_CLIENT_TIERS`       | no       | empty         | Fallback per-client tiers, format `raw_key:pro,raw_key:enterprise`. Applied once at startup; `client_tiers` rows override |
 | `ROUTERFUEL_CLIENT_SYNC_SECS`   | no       | 30            | How often to re-read the `client_tiers` table for new keys and tier changes |
 | `ROUTERFUEL_ADMIN_KEY`          | no       | empty         | Key required to access `/admin/*` endpoints (`X-Admin-Key` header)  |
+| `ROUTERFUEL_SUPERCOMPRESS_MODE` | no       | `audit`       | Prompt compression before the request is sent: `audit` (measure and log only, the default), `on` (apply), `off`. Tier 1 is lossless — whitespace normalization outside code fences plus exact-duplicate message dedup — with no LLM call and no extra vendor. Per-request override via the `supercompress` object |
 | `EMBEDDING_MODEL_PATH`          | no       | `./models/embedding.onnx` | ONNX embedding model path (ships with the repo; enables semantic cache) |
 | `EMBEDDING_TOKENIZER_PATH`      | no       | `./models/tokenizer.json` | Matching tokenizer path (ships with the repo)              |
 | `LOOP_GUARD_REPEAT_THRESHOLD`   | no       | 4             | Repeats of an identical prompt before it's flagged as a loop        |
