@@ -446,6 +446,34 @@ impl RouteEngine {
             // OPENAI — POST https://api.openai.com/v1/chat/completions
             // Header: Authorization: Bearer <key>
             // ================================================================
+            // Launched 2026-09-03. Two things here are not like the others:
+            //
+            // 1. `enabled: false` on purpose, not as a placeholder. Astra is
+            //    rolling out to Trusted Access Program enterprises first,
+            //    with general API access "in the coming days". Because
+            //    find() ignores `enabled` while select_*() honours it, this
+            //    gives exactly the right semantics for a limited rollout: a
+            //    client who names "gpt-6-astra" explicitly gets routed to
+            //    OpenAI, but "auto"/"task:" routing will not pick a model
+            //    most clients cannot call yet, and /v1/models (which uses
+            //    list_enabled) does not advertise it. Flip to true on GA.
+            //
+            // 2. The cost figures below are OpenAI's SHORT-context rates.
+            //    Astra is the first entry here with tiered pricing: above
+            //    ~272k input tokens OpenAI charges 2x input and 1.5x output
+            //    for the whole request ($20/$75 per 1M). ModelConfig has one
+            //    flat rate per direction and cannot express that, so on
+            //    requests past the threshold the router under-prices Astra —
+            //    which also means get_pricing() under-estimates and
+            //    SpendGuard under-reserves exactly where the amounts are
+            //    largest. Short-context rates are the right single value
+            //    (they cover almost all traffic), but see the note in
+            //    CHANGES/README: real tiered support needs a ModelConfig
+            //    change, not a different constant here.
+            model!(api_id: "gpt-6-astra", display_name: "GPT-6 Astra", provider: Provider::OpenAI,
+                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.99, context: 1_100_000,
+                vision: true, open_weight: false, enabled: false),
+
             model!(api_id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", provider: Provider::OpenAI,
                 cost_in: 500.0, cost_out: 3000.0, latency_ms: 250, quality: 0.99, context: 1_050_000,
                 vision: true, open_weight: false, enabled: true),
@@ -1340,6 +1368,33 @@ mod tests {
         only_mistral.insert(Provider::Mistral);
         let shape = RequestShape { task: TaskKind::General, difficulty: Difficulty::Simple };
         assert!(e.select_for_shape(shape, 300, 256, Some(&only_mistral)).is_ok());
+    }
+
+    #[test]
+    fn astra_is_registered_but_not_auto_selectable() {
+        let e = RouteEngine::new();
+
+        // Nameable and priceable: a Trusted Access client can request it.
+        let m = e.find("gpt-6-astra").unwrap();
+        assert_eq!(m.provider, Provider::OpenAI);
+        assert_eq!(m.context_window, 1_100_000);
+        assert!(m.supports_vision);
+        assert_eq!(e.get_pricing("gpt-6-astra").unwrap(), (1000.0, 5000.0));
+        assert_eq!(
+            e.select_provider("gpt-6-astra", false, false).unwrap(),
+            Provider::OpenAI
+        );
+
+        // But disabled, so it is neither advertised nor auto-selected while
+        // general API access is still rolling out.
+        assert!(!m.enabled);
+        assert!(!e.list_enabled().iter().any(|m| m.api_id == "gpt-6-astra"));
+
+        // Even a 1M-token Quality-priority request must not land on it.
+        let d = e
+            .select_reachable(900_000, 4096, RoutingPriority::Quality, None)
+            .unwrap();
+        assert_ne!(d.model.api_id, "gpt-6-astra");
     }
 
     #[test]
