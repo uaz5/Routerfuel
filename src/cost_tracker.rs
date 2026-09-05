@@ -227,6 +227,9 @@ impl CostTracker {
         priority: Option<String>,
         is_byok: bool,
         from_cache: bool,
+        // Full handler wall-clock, where the caller can measure it. See
+        // migration 009 for why this is Option rather than defaulting to 0.
+        total_latency_ms: Option<u64>,
     ) {
         // Log BEFORE variables get moved into tokio::spawn
         debug!(
@@ -257,6 +260,7 @@ impl CostTracker {
                 priority,
                 is_byok,
                 from_cache,
+                total_latency_ms,
             )
             .await
             {
@@ -280,6 +284,10 @@ impl CostTracker {
         latency_ms: u64,
         routing_decision_ms: u64,
         client_id: Option<String>,
+        // Full handler wall-clock. On an error path the provider call may
+        // not have happened at all, so `latency_ms` above stays whatever
+        // the caller had; this is the one figure that is always meaningful.
+        total_latency_ms: Option<u64>,
     ) {
         // Log BEFORE variables get moved into tokio::spawn
         debug!(
@@ -300,9 +308,10 @@ impl CostTracker {
                     cost_cents, cost_saved_cents,
                     latency_ms, routing_decision_ms,
                     client_id,
+                    total_latency_ms,
                     status, error_message
                 )
-                VALUES ($1, $2, $3, 0, 0, 0, 0, $4, $5, $6, 'failed', $7)
+                VALUES ($1, $2, $3, 0, 0, 0, 0, $4, $5, $6, $7, 'failed', $8)
                 "#,
             )
             .bind(&request_id)
@@ -311,6 +320,7 @@ impl CostTracker {
             .bind(latency_ms as i32)
             .bind(routing_decision_ms as i32)
             .bind(&client_id)
+            .bind(total_latency_ms.map(|v| v as i32))
             .bind(&error_message)
             .execute(pool.as_ref())
             .await
@@ -346,6 +356,10 @@ impl CostTracker {
         priority: Option<String>,
         is_byok: bool,
         from_cache: bool,
+        // Full handler wall-clock. `None` where a caller genuinely cannot
+        // measure it — never 0 as a stand-in, which would read as a real
+        // measurement and skew AVG(). See migration 009.
+        total_latency_ms: Option<u64>,
     ) -> Result<(), CostTrackerError> {
         let cost_saved = baseline_cost_cents - token_cost.total_cost_cents;
 
@@ -358,9 +372,10 @@ impl CostTracker {
                 latency_ms, routing_decision_ms,
                 client_id, user_tier, priority,
                 is_byok, from_cache,
+                total_latency_ms,
                 status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'success')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'success')
             "#,
         )
         .bind(&request_id)
@@ -377,6 +392,7 @@ impl CostTracker {
         .bind(&priority)
         .bind(is_byok)
         .bind(from_cache)
+        .bind(total_latency_ms.map(|v| v as i32))
         .execute(pool.as_ref())
         .await?;
 

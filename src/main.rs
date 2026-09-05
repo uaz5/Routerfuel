@@ -579,13 +579,20 @@ async fn handle_non_streaming(
                 cached_response.model.clone(),
                 &token_cost,
                 baseline_cost.total_cost_cents,
-                cache_hit_latency_ms,
+                // latency_ms is provider round-trip only, and a cache hit
+                // calls no provider — so 0 is the honest value here, not the
+                // wall-clock figure this used to record. NOTE: this lowers
+                // AVG(latency_ms) wherever cache hits exist; `from_cache`
+                // is already a column, so filter on it to compare
+                // like-for-like.
+                0,
                 0,
                 client_id,
                 None,
                 None,
                 true,
                 true, // from_cache
+                Some(cache_hit_latency_ms),
             );
 
             return Ok(Json(cached_response));
@@ -709,9 +716,15 @@ async fn handle_non_streaming(
                 byok.provider_to_call,
                 routing_model_id.clone(),
                 e.to_string(),
+                // On a failure the provider call may not have happened, or
+                // may have died partway — there is no separable provider
+                // figure, so both columns carry the same wall-clock value
+                // and overhead computes to 0. Error rows (status='failed')
+                // should be excluded from latency analysis anyway.
                 start.elapsed().as_millis() as u64,
                 routing_decision_ms,
                 client_id.clone(),
+                Some(start.elapsed().as_millis() as u64),
             );
 
             match e {
@@ -838,6 +851,14 @@ async fn handle_non_streaming(
         }
     }
 
+    // Computed before the log call so both figures land on the same row:
+    // `latency_ms` below is the connector's provider-only measurement,
+    // `total_latency` is the whole handler including auth, token counting,
+    // the semantic-cache lookup and the spend reservation. Their difference
+    // is RouterFuel's own overhead — which was previously unrecoverable,
+    // because no column held the total.
+    let total_latency = start.elapsed().as_millis() as u64;
+
     state.cost_tracker.record_request(
         request_id.clone(),
         byok.provider_to_call,
@@ -851,9 +872,8 @@ async fn handle_non_streaming(
         None,
         true,
         false, // this is the real-provider-call path, not a cache hit
+        Some(total_latency),
     );
-
-    let total_latency = start.elapsed().as_millis() as u64;
 
     info!(
         request_id = %request_id,

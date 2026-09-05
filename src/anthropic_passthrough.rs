@@ -279,6 +279,9 @@ pub async fn messages_handler(
     let rb = forward_protocol_headers(rb, &headers);
     let outbound = normalize_body_model(&body, &parsed, &model);
 
+    // Timed separately from `start` so latency_ms stays provider-only and
+    // total_latency_ms carries the whole handler — see migration 009.
+    let provider_start = Instant::now();
     let upstream = match rb.body(outbound).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -295,9 +298,13 @@ pub async fn messages_handler(
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if is_stream && status.is_success() {
+        // Time-to-headers is the only provider-only figure available on a
+        // stream; the body arrives incrementally for as long as generation
+        // runs.
+        let provider_headers_ms = provider_start.elapsed().as_millis() as u64;
         return relay_stream(
             state, upstream, status, request_id, rl_key, client_id, model.to_string(),
-            estimated, rate_in, rate_out, start,
+            estimated, rate_in, rate_out, start, provider_headers_ms,
         );
     }
 
@@ -329,7 +336,12 @@ pub async fn messages_handler(
         .reconcile(&rl_key, estimated.total_cost_cents, actual.total_cost_cents);
 
     log_passthrough(
-        &state, request_id, model.to_string(), &actual, client_id,
+        &state,
+        request_id,
+        model.to_string(),
+        &actual,
+        client_id,
+        provider_start.elapsed().as_millis() as u64,
         start.elapsed().as_millis() as u64,
     );
 
@@ -480,6 +492,7 @@ fn relay_stream(
     rate_in: f64,
     rate_out: f64,
     start: Instant,
+    provider_headers_ms: u64,
 ) -> Response {
     let mut upstream_stream = upstream.bytes_stream();
 
@@ -532,7 +545,12 @@ fn relay_stream(
             "native /v1/messages stream finished; spend reconciled"
         );
         log_passthrough(
-            &state, request_id, model, &actual, client_id,
+            &state,
+            request_id,
+            model,
+            &actual,
+            client_id,
+            provider_headers_ms,
             start.elapsed().as_millis() as u64,
         );
     };
@@ -555,18 +573,29 @@ fn log_passthrough(
     model: String,
     cost: &TokenCostBreakdown,
     client_id: Option<String>,
-    latency_ms: u64,
+    // Provider round-trip only. On the streaming path this is time-to-
+    // headers, since the body arrives incrementally over the whole
+    // generation and lumping that in would repeat the mistake
+    // streaming.rs currently makes.
+    provider_ms: u64,
+    // Full handler wall-clock.
+    total_ms: u64,
 ) {
     state.cost_tracker.record_request(
         request_id,
         Provider::Anthropic,
         model,
         cost,
-        // No GPT-4o baseline comparison on this path: the client named the
-        // model, so there is no alternative RouterFuel declined to pick and
-        // therefore no "savings" figure that would mean anything.
-        0.0,
-        latency_ms,
+        // No baseline comparison on this path: the client named the model,
+        // so there is no alternative RouterFuel declined to pick and no
+        // "savings" figure that would mean anything.
+        //
+        // Passing the actual cost rather than 0.0 so cost_saved_cents comes
+        // out as exactly zero. With 0.0 the stored saving is -cost, which
+        // surfaced on the dashboard as a negative "total saved" — verified
+        // live before this was corrected.
+        cost.total_cost_cents,
+        provider_ms,
         // routing_decision_ms is 0 by construction — this endpoint performs
         // no model selection.
         0,
@@ -575,6 +604,7 @@ fn log_passthrough(
         None,
         true,  // is_byok — always, this endpoint has no other mode
         false, // from_cache — no semantic cache on the native path
+        Some(total_ms),
     );
 }
 

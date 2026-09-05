@@ -159,6 +159,15 @@ pub async fn stream_handler(
                 model_api_id_clone,
                 &token_cost,
                 baseline_cost.total_cost_cents,
+                // DEFERRED (see migration 009): payload.latency_ms is
+                // stream_handler wall-clock, which conflates the provider
+                // call with the entire generation — a long stream reads as
+                // huge "provider latency". Splitting it needs a second
+                // Instant around just the upstream call and was scoped out
+                // of the latency-breakdown change. Until then both columns
+                // carry the same value, so overhead computes to 0 for
+                // streaming rows, which correctly signals "not yet
+                // separable" rather than "no overhead".
                 payload.latency_ms,
                 0,
                 client_id_clone,
@@ -166,6 +175,7 @@ pub async fn stream_handler(
                 Some("streaming".to_string()),
                 is_byok,
                 false, // streaming never serves from the semantic cache
+                Some(payload.latency_ms),
             );
         } else {
             // FIX: audit_tx was dropped without ever sending — the stream

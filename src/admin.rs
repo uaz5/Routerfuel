@@ -153,6 +153,14 @@ pub struct OverviewResponse {
     pub total_saved_pct: f64,
     pub avg_latency_ms: f64,
     pub avg_routing_ms: f64,
+    /// Full handler wall-clock. NULL in rows predating migration 009, and
+    /// AVG skips those — so on a range spanning the deploy this reflects
+    /// only the instrumented rows.
+    pub avg_total_latency_ms: f64,
+    /// RouterFuel's own overhead: avg(total_latency_ms - latency_ms).
+    /// Reads 0 for streaming and error rows, where the two figures are not
+    /// yet separable — see migration 009.
+    pub avg_overhead_ms: f64,
     pub cache_hits: i64,
     pub cache_hit_rate_pct: f64,
     pub byok_requests: i64,
@@ -241,6 +249,8 @@ pub async fn overview_handler(
             COALESCE(SUM(cost_saved_cents) / 100.0, 0)::float8 AS total_saved_usd,
             COALESCE(AVG(latency_ms), 0)::float8             AS avg_latency_ms,
             COALESCE(AVG(routing_decision_ms), 0)::float8    AS avg_routing_ms,
+            COALESCE(AVG(total_latency_ms), 0)::float8       AS avg_total_latency_ms,
+            COALESCE(AVG(total_latency_ms - latency_ms), 0)::float8 AS avg_overhead_ms,
             COUNT(*) FILTER (WHERE from_cache = TRUE)        AS cache_hits,
             COUNT(*) FILTER (WHERE is_byok = TRUE)           AS byok_requests
         FROM request_logs
@@ -281,6 +291,8 @@ pub async fn overview_handler(
                 total_saved_pct: saved_pct,
                 avg_latency_ms: r.get("avg_latency_ms"),
                 avg_routing_ms: r.get("avg_routing_ms"),
+                avg_total_latency_ms: r.get("avg_total_latency_ms"),
+                avg_overhead_ms: r.get("avg_overhead_ms"),
                 cache_hits: hits,
                 cache_hit_rate_pct: hit_pct,
                 byok_requests: r.get("byok_requests"),

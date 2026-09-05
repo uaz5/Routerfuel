@@ -229,9 +229,14 @@
       <div class="kpi-sub" id="kpiCacheSub">&nbsp;</div>
     </div>
     <div class="card">
-      <div class="kpi-label">Avg latency / routing</div>
+      <div class="kpi-label">Avg provider latency / routing</div>
       <div class="kpi-value" id="kpiLatency">—</div>
       <div class="kpi-sub" id="kpiRouting">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">Avg total / gateway overhead</div>
+      <div class="kpi-value" id="kpiTotalLatency">—</div>
+      <div class="kpi-sub" id="kpiOverhead">&nbsp;</div>
     </div>
   </div>
 
@@ -402,6 +407,12 @@ async function loadOverview(){
   $('kpiCacheSub').textContent = `${fmtInt(d.cache_hits)} hits`;
   $('kpiLatency').textContent = fmtMs(d.avg_latency_ms);
   $('kpiRouting').textContent = `routing ${d.avg_routing_ms.toFixed(1)}ms`;
+  // Added with migration 009. Rows written before it have a NULL
+  // total_latency_ms and are skipped by AVG, so a range spanning the
+  // deploy shows only instrumented traffic. Overhead reads 0 for
+  // streaming and error rows, where the two figures are not yet separable.
+  $('kpiTotalLatency').textContent = fmtMs(d.avg_total_latency_ms);
+  $('kpiOverhead').textContent = `gateway ${d.avg_overhead_ms.toFixed(1)}ms`;
   setGauge(d.total_saved_pct);
 }
 
