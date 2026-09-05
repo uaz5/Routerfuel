@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 // ============================================================================
 // PROVIDER ENUM
@@ -1054,14 +1054,45 @@ pub fn build_openai_compatible_body(req: &ChatCompletionRequest) -> serde_json::
         "messages": messages,
     });
 
+    // Some models reject fields the rest of the ecosystem accepts, with a
+    // 400 rather than by ignoring them — so forwarding a client's request
+    // verbatim fails the call. See route_engine::param_policy_for.
+    let policy = crate::route_engine::param_policy_for(&req.model);
+    use crate::route_engine::OutputTokenField;
+
     if let Some(t) = req.temperature {
-        body["temperature"] = serde_json::json!(t);
-    }
-    if let Some(mt) = req.max_tokens {
-        body["max_tokens"] = serde_json::json!(mt);
+        if policy.drop_temperature {
+            warn!(
+                model = %req.model,
+                "dropping client-supplied `temperature`: this model rejects it. \
+                 The request proceeds at the model's own default sampling."
+            );
+        } else {
+            body["temperature"] = serde_json::json!(t);
+        }
     }
     if let Some(tp) = req.top_p {
-        body["top_p"] = serde_json::json!(tp);
+        if policy.drop_top_p {
+            warn!(
+                model = %req.model,
+                "dropping client-supplied `top_p`: this model rejects it. \
+                 The request proceeds at the model's own default sampling."
+            );
+        } else {
+            body["top_p"] = serde_json::json!(tp);
+        }
+    }
+    // A rename, not a drop — the cap is still honoured, so this needs no
+    // warning. `max_tokens` is not merely ignored by OpenAI's reasoning
+    // models; it is rejected, which is why this is a correctness fix rather
+    // than a tidy-up.
+    if let Some(mt) = req.max_tokens {
+        match policy.output_token_field {
+            OutputTokenField::MaxTokens => body["max_tokens"] = serde_json::json!(mt),
+            OutputTokenField::MaxCompletionTokens => {
+                body["max_completion_tokens"] = serde_json::json!(mt)
+            }
+        }
     }
     if let Some(s) = req.stream {
         body["stream"] = serde_json::json!(s);
@@ -1169,4 +1200,73 @@ async fn openai_compatible_call_with_auth_header(
 
     let body = build_openai_compatible_body(_req);
     openai_compatible_call_with_builder(builder, &body, _req, provider, cb).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vision::MessageContent;
+
+    fn req(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Text("hi".into()),
+            }],
+            // Binary-exact so the assertions can compare equal: an f32 like
+            // 0.7 widens to 0.699999988079071 as JSON f64.
+            temperature: Some(0.5),
+            max_tokens: Some(256),
+            top_p: Some(0.75),
+            stream: None,
+            shadow_model: None,
+            supercompress: None,
+        }
+    }
+
+    #[test]
+    fn permissive_models_get_every_param_verbatim() {
+        let body = build_openai_compatible_body(&req("deepseek-v4-pro"));
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["top_p"], 0.75);
+        assert_eq!(body["max_tokens"], 256);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn openai_reasoning_models_lose_sampling_and_rename_the_token_cap() {
+        // The live defect this fixes: max_tokens is rejected by these
+        // models, not ignored, so the request failed outright.
+        let body = build_openai_compatible_body(&req("gpt-5.5"));
+        assert!(body.get("temperature").is_none(), "temperature must be stripped");
+        assert!(body.get("top_p").is_none(), "top_p must be stripped");
+        assert!(body.get("max_tokens").is_none(), "max_tokens must not be sent");
+        assert_eq!(
+            body["max_completion_tokens"], 256,
+            "the cap must survive the rename, not be dropped"
+        );
+    }
+
+    #[test]
+    fn dropping_params_never_drops_the_message_payload() {
+        // Guards against a filter that strips more than it should.
+        let body = build_openai_compatible_body(&req("gpt-6-astra"));
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["max_completion_tokens"], 256);
+    }
+
+    #[test]
+    fn absent_params_stay_absent_rather_than_becoming_null() {
+        let mut r = req("gpt-5.4-mini");
+        r.temperature = None;
+        r.top_p = None;
+        r.max_tokens = None;
+        let body = build_openai_compatible_body(&r);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+    }
 }

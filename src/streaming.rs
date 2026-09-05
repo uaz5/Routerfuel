@@ -17,7 +17,7 @@ use crate::concurrency::ConcurrencyLimiter;
 use crate::connectors::{provider_base_url, to_gemini_body, ChatCompletionRequest, Provider};
 use crate::cost_tracker::CostTracker;
 use crate::guardrails::SpendGuard;
-use crate::route_engine::RouteEngine;
+use crate::route_engine::{OutputTokenField, RouteEngine};
 use crate::tokens::TokenCostBreakdown;
 use async_stream::try_stream;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 // SSE chunk types
 #[derive(Debug, Deserialize)]
@@ -228,6 +228,15 @@ pub async fn stream_handler(
             // Azure OpenAI streaming uses the same OpenAI-compatible format
             // but with a deployment-specific URL constructed from the connection string.
             // The api_key contains the full connection string; we parse it here.
+            //
+            // NOT param-filtered, unlike the generic arm below, and this is a
+            // known gap rather than an oversight: Azure serves the same
+            // reasoning models with the same temperature/top_p/max_tokens
+            // restrictions, but `req.model` here is a customer-chosen
+            // DEPLOYMENT name, not an api_id. param_policy_for would match
+            // it only by coincidence, so calling it would look like coverage
+            // while providing none. Closing this needs a deployment->model
+            // mapping. Tracked with the body-builder consolidation.
             let (endpoint, _key) = parse_azure_connection_for_streaming(&api_key);
             let url = format!(
                 "{}/openai/deployments/{}/chat/completions?api-version=2024-02-15-preview",
@@ -250,9 +259,47 @@ pub async fn stream_handler(
             body["stream"] = serde_json::Value::Bool(true);
             (url, body)
         }
+        // OpenAI, DeepSeek, Mistral, xAI, Qwen, Moonshot, Zhipu, Meta,
+        // OpenRouter — everything OpenAI-compatible.
+        //
+        // Note this serialises ChatCompletionRequest directly instead of
+        // calling connectors::build_openai_compatible_body, so it is a second
+        // body builder that has to repeat the same parameter filtering. That
+        // divergence is exactly why the max_tokens defect survived on the
+        // streaming path; consolidating the two is tracked separately.
         _ => {
             let mut body = serde_json::to_value(&req).unwrap_or_default();
             body["stream"] = serde_json::Value::Bool(true);
+
+            // Same restrictions as the non-streaming path — see
+            // route_engine::param_policy_for. serde emits whatever the client
+            // sent, so the fields have to be removed after the fact here
+            // rather than skipped during assembly.
+            let policy = crate::route_engine::param_policy_for(&req.model);
+            if let Some(obj) = body.as_object_mut() {
+                if policy.drop_temperature && obj.remove("temperature").is_some() {
+                    warn!(
+                        model = %req.model,
+                        "dropping client-supplied `temperature`: this model rejects it. \
+                         The request proceeds at the model's own default sampling."
+                    );
+                }
+                if policy.drop_top_p && obj.remove("top_p").is_some() {
+                    warn!(
+                        model = %req.model,
+                        "dropping client-supplied `top_p`: this model rejects it. \
+                         The request proceeds at the model's own default sampling."
+                    );
+                }
+                // A rename, not a drop, so no warning — but a hard 400 from
+                // OpenAI's reasoning models if left as `max_tokens`.
+                if policy.output_token_field == OutputTokenField::MaxCompletionTokens {
+                    if let Some(mt) = obj.remove("max_tokens") {
+                        obj.insert("max_completion_tokens".to_string(), mt);
+                    }
+                }
+            }
+
             (provider_base_url(provider).to_string(), body)
         }
     };

@@ -1359,6 +1359,107 @@ pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Which field carries the output-token cap on an OpenAI-compatible body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputTokenField {
+    /// The historical field every OpenAI-compatible provider accepts.
+    MaxTokens,
+    /// What OpenAI's reasoning models require on Chat Completions instead;
+    /// they reject `max_tokens` outright rather than ignoring it.
+    MaxCompletionTokens,
+}
+
+/// Per-model request-parameter restrictions.
+///
+/// Some models reject fields that the rest of the ecosystem accepts, and
+/// reject them with a 400 rather than ignoring them — so a gateway that
+/// forwards a client's request verbatim fails the call outright. This
+/// describes what has to be stripped or renamed before a body goes out.
+///
+/// Only fields RouterFuel actually sends are modelled. It sends four
+/// (`temperature`, `top_p`, `max_tokens`, `stream`), so restrictions on
+/// `presence_penalty`, `frequency_penalty`, `stop`, `logit_bias` and friends
+/// are real for some providers but cannot bite us and are not represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamPolicy {
+    pub drop_temperature: bool,
+    pub drop_top_p: bool,
+    pub output_token_field: OutputTokenField,
+}
+
+impl Default for ParamPolicy {
+    /// Permissive: send everything, as every provider but OpenAI expects.
+    fn default() -> Self {
+        Self {
+            drop_temperature: false,
+            drop_top_p: false,
+            output_token_field: OutputTokenField::MaxTokens,
+        }
+    }
+}
+
+impl ParamPolicy {
+    /// The restrictions shared by every OpenAI reasoning model.
+    const OPENAI_REASONING: Self = Self {
+        drop_temperature: true,
+        drop_top_p: true,
+        output_token_field: OutputTokenField::MaxCompletionTokens,
+    };
+}
+
+/// Request-parameter restrictions for a model, keyed on the api_id as it
+/// will actually be sent.
+///
+/// A free function rather than a `ModelConfig` field because the connectors
+/// that build request bodies hold no registry handle, and the alternative --
+/// threading a policy through the `Connector` trait -- is a much wider change
+/// for the same result. Unknown ids get `Default`, so registry entries merged
+/// at runtime from the OpenRouter and Bedrock catalogs need no policy.
+///
+/// Keying on the id AS SENT is what makes both BYOK paths correct, and the
+/// distinction is easy to miss. A client with a direct OpenAI key sends
+/// "gpt-5.5" and gets the restrictions applied. A client with only an
+/// OpenRouter key has the model rewritten to "openai/gpt-5.5" by
+/// resolve_byok_route, matches nothing here, and keeps `max_tokens` --
+/// which is right, because OpenRouter's own API accepts `max_tokens` and
+/// translates it. Matching on a normalized or pre-rewrite id would break
+/// the second case to "fix" the first.
+///
+/// SOURCE / ASSUMPTION (docs-only, no authenticated request made): Azure
+/// Foundry's reasoning-model reference states that the models below reject
+/// `temperature` and `top_p`, and that "Reasoning models will only work with
+/// the `max_completion_tokens` parameter when using the Chat Completions
+/// API." Every OpenAI entry in the registry except gpt-oss-20b is a
+/// reasoning model.
+pub fn param_policy_for(api_id: &str) -> ParamPolicy {
+    match api_id {
+        // ASSUMPTION, narrower than the rest: the same reference lists
+        // Astra's unsupported parameters as temperature and top_p only, and
+        // explicitly scopes the `max_tokens` exclusion to "other reasoning
+        // models" -- Astra's own table has no max_tokens row either way. It
+        // is treated as needing max_completion_tokens on the grounds that it
+        // is a reasoning model and the footnote is generic, but that is
+        // inferred, not stated. Astra is disabled today, so this cannot
+        // affect live traffic before someone verifies it with a key.
+        "gpt-6-astra" => ParamPolicy::OPENAI_REASONING,
+
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => ParamPolicy::OPENAI_REASONING,
+        "gpt-5.5" => ParamPolicy::OPENAI_REASONING,
+        "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" => ParamPolicy::OPENAI_REASONING,
+
+        // gpt-oss-20b is deliberately absent: it is the one OpenAI entry
+        // that is not a reasoning model, so it takes the permissive default.
+        //
+        // Other providers are absent on purpose too, having been checked:
+        // xAI reasoning models error on presence_penalty/frequency_penalty/
+        // stop, none of which RouterFuel sends; DeepSeek V4 silently ignores
+        // temperature/top_p in thinking mode rather than erroring, so
+        // stripping them would change nothing but lose the client's intent
+        // on any request that disables thinking.
+        _ => ParamPolicy::default(),
+    }
+}
+
 impl Default for RouteEngine {
     fn default() -> Self { Self::new() }
 }
@@ -1989,5 +2090,66 @@ mod tests {
         for m in e.list_enabled().iter().filter(|m| m.provider == Provider::XAI) {
             assert!(m.context_window <= 1_000_000, "{} claims {}", m.api_id, m.context_window);
         }
+    }
+    // ---- Per-model request-parameter restrictions (param_policy_for) ----
+
+    #[test]
+    fn openai_reasoning_models_reject_sampling_params_and_rename_max_tokens() {
+        // Every OpenAI entry except gpt-oss-20b is a reasoning model, and
+        // all of them reject max_tokens outright rather than ignoring it --
+        // so before this policy existed the enabled OpenAI lineup 400'd on
+        // any request that set it.
+        for id in [
+            "gpt-6-astra",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+        ] {
+            let p = param_policy_for(id);
+            assert!(p.drop_temperature, "{id} must drop temperature");
+            assert!(p.drop_top_p, "{id} must drop top_p");
+            assert_eq!(
+                p.output_token_field,
+                OutputTokenField::MaxCompletionTokens,
+                "{id} must send max_completion_tokens"
+            );
+        }
+
+        // The one OpenAI entry that is not a reasoning model.
+        assert_eq!(param_policy_for("gpt-oss-20b"), ParamPolicy::default());
+    }
+
+    #[test]
+    fn param_policy_defaults_to_permissive_for_everything_else() {
+        // The property that makes it safe to call param_policy_for
+        // unconditionally at every body-build site.
+        let e = RouteEngine::new();
+        for m in e.list_enabled() {
+            if m.provider == Provider::OpenAI {
+                continue;
+            }
+            assert_eq!(
+                param_policy_for(&m.api_id),
+                ParamPolicy::default(),
+                "{} should be unrestricted", m.api_id
+            );
+        }
+
+        // Unknown ids too -- runtime-merged OpenRouter/Bedrock catalog
+        // entries never appear in the match.
+        assert_eq!(param_policy_for("some/unknown-model"), ParamPolicy::default());
+    }
+
+    #[test]
+    fn openrouter_rewritten_openai_ids_keep_max_tokens() {
+        // The subtle half of keying on the id AS SENT. A client with only an
+        // OpenRouter key has "gpt-5.5" rewritten to "openai/gpt-5.5" before
+        // the body is built, and OpenRouter's own API accepts max_tokens and
+        // translates it -- so the prefixed form must NOT be filtered.
+        assert_eq!(param_policy_for("openai/gpt-5.5"), ParamPolicy::default());
+        assert_eq!(param_policy_for("openai/gpt-6-astra"), ParamPolicy::default());
+
+        // While the direct form still is.
+        assert!(param_policy_for("gpt-5.5").drop_temperature);
     }
 }
