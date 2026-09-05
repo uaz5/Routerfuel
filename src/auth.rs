@@ -555,26 +555,43 @@ mod tests {
     }
 }
 // =============================================================================
-// CURSOR BRIDGE
+// SINGLE-HEADER AUTH BRIDGE  (Cursor, Claude Code, and anything like them)
 //
-// Cursor's "Override OpenAI Base URL" integration sends exactly one opaque
-// string as an `Authorization: Bearer <token>` header — no custom headers,
-// no way to send X-API-Key and X-<Provider>-Api-Key separately the way
-// RouterFuel's own auth model expects.
+// Several clients can only be pointed at a custom base URL together with
+// exactly one opaque credential — Cursor's "Override OpenAI Base URL" field,
+// and Claude Code's ANTHROPIC_AUTH_TOKEN, both send a single
+// `Authorization: Bearer <token>` header. Neither can send custom headers,
+// so there is no way to supply X-API-Key and X-<Provider>-Api-Key
+// separately the way RouterFuel's own auth model expects.
+//
+// (Named cursor_bridge_middleware for historical reasons — Cursor was the
+// first client that needed it. It is protocol-agnostic and now also serves
+// the native /v1/messages endpoint; see src/anthropic_passthrough.rs.)
 //
 // This middleware sits in front of api_key_middleware and translates a
 // composite Bearer token into the two headers RouterFuel already knows how
 // to read. It's a pure adapter — resolve_byok_route, ClientProviderKeys,
 // ApiKeyStore are all untouched.
 //
-// Token format (what the user pastes into Cursor's API Key field):
+// Token format (paste into Cursor's API Key field, or set as
+// ANTHROPIC_AUTH_TOKEN for Claude Code):
 //
 //     <routerfuel_api_key>:<provider>:<byok_provider_key>
 //
 // e.g.  rf_live_abc123:anthropic:sk-ant-...
 //       rf_live_abc123:openrouter:sk-or-...   (universal fallback — works
 //                                               for any model if you're not
-//                                               sure which provider to pick)
+//                                               sure which provider to pick;
+//                                               NOT valid on /v1/messages,
+//                                               which is Anthropic-native)
+//
+// Claude Code setup:
+//     ANTHROPIC_BASE_URL=https://your-routerfuel-host
+//     ANTHROPIC_AUTH_TOKEN=rf_live_abc123:anthropic:sk-ant-...
+// and make sure ANTHROPIC_API_KEY is UNSET — if it is set, Claude Code
+// sends x-api-key instead of a Bearer token, this bridge short-circuits on
+// the branch below, and the Anthropic key gets read as RouterFuel's own
+// client key.
 //
 // Split with splitn(3, ':') so a colon-containing provider key (unusual,
 // but not impossible for some providers) still lands entirely in the third
@@ -611,7 +628,8 @@ pub async fn cursor_bridge_middleware(mut request: Request<Body>, next: Next) ->
         return unauthorized(
             "Authorization Bearer token is not a valid RouterFuel composite key. \
              Expected format: <routerfuel_api_key>:<provider>:<byok_provider_key>, \
-             e.g. rf_live_xxx:anthropic:sk-ant-xxx. See /docs/cursor for setup.",
+             e.g. rf_live_xxx:anthropic:sk-ant-xxx. Set this as Cursor's API Key, or as \
+             ANTHROPIC_AUTH_TOKEN for Claude Code (with ANTHROPIC_API_KEY unset).",
         );
     };
 
@@ -638,7 +656,8 @@ pub async fn cursor_bridge_middleware(mut request: Request<Body>, next: Next) ->
             return unauthorized(
                 "Unknown provider in composite key. Expected one of: openai, anthropic, \
                  deepseek, gemini, mistral, xai, qwen, moonshot, zhipu, meta, openrouter, \
-                 azure, bedrock. See /docs/cursor for the composite key format.",
+                 azure, bedrock. The composite key format is \
+                 <routerfuel_api_key>:<provider>:<byok_provider_key>.",
             );
         }
     };

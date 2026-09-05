@@ -16,6 +16,7 @@ mod guardrails;
 mod openrouter_catalog;
 mod rate_limiter;
 mod route_engine;
+mod anthropic_passthrough;
 mod semantic_cache;
 mod supercompress;
 mod streaming;
@@ -1317,14 +1318,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
 
+    // Native Anthropic Messages API surface. Separate state from the
+    // OpenAI-shaped path because the passthrough touches only a subset —
+    // no semantic cache, no vision conversion, no connectors.
+    let passthrough_state = anthropic_passthrough::PassthroughState {
+        route_engine: Arc::clone(&state.route_engine),
+        cost_tracker: Arc::clone(&state.cost_tracker),
+        spend_guard: Arc::clone(&state.spend_guard),
+        loop_guard: Arc::clone(&state.loop_guard),
+        rate_limiter: Arc::clone(&state.rate_limiter),
+        http: reqwest::Client::new(),
+    };
+
+    let native_routes = Router::new()
+        .route("/v1/messages", post(anthropic_passthrough::messages_handler))
+        .route(
+            "/v1/messages/count_tokens",
+            post(anthropic_passthrough::count_tokens_handler),
+        )
+        .with_state(passthrough_state);
+
     let protected_routes = Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
         .with_state(state.clone())
+        // Both surfaces sit behind the same two auth layers, so a single
+        // composite Bearer token works identically for Cursor (OpenAI
+        // shape) and Claude Code (native shape).
+        .merge(native_routes)
         .layer(middleware::from_fn_with_state(
             api_key_store,
             api_key_middleware,
         ))
-.layer(middleware::from_fn(cursor_bridge_middleware));
+        .layer(middleware::from_fn(cursor_bridge_middleware));
     
     let public_routes = Router::new()
     .route("/health", get(health_handler))

@@ -1061,6 +1061,25 @@ impl RouteEngine {
     }
 }
 
+/// Strips a bracketed variant suffix from a model id.
+///
+/// Claude Code identifies the long-context variant of a model as
+/// `claude-opus-5[1m]`, and that string can reach the gateway verbatim on
+/// the native `/v1/messages` endpoint. The registry keys on the provider's
+/// real api_id (`claude-opus-5`), so a bracketed id would miss `find()` and
+/// be reported as an unknown model.
+///
+/// Only the bracketed *suffix* is removed, and only the portion from the
+/// first `[` onward — a model id that legitimately contains no bracket is
+/// returned untouched, and this borrows rather than allocating so it is
+/// free on the common path.
+pub fn normalize_model_id(model: &str) -> &str {
+    match model.find('[') {
+        Some(i) => model[..i].trim_end(),
+        None => model,
+    }
+}
+
 pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
     match direct_api_id {
         "gemini-3-flash" => Some("google/gemini-3-flash-preview"),
@@ -1422,6 +1441,32 @@ mod tests {
         only_mistral.insert(Provider::Mistral);
         let shape = RequestShape { task: TaskKind::General, difficulty: Difficulty::Simple };
         assert!(e.select_for_shape(shape, 300, 256, Some(&only_mistral)).is_ok());
+    }
+
+    #[test]
+    fn normalize_model_id_strips_claude_code_bracket_suffix() {
+        // The case that motivated this: Claude Code's long-context variant.
+        assert_eq!(normalize_model_id("claude-opus-5[1m]"), "claude-opus-5");
+        assert_eq!(normalize_model_id("claude-sonnet-5[1m]"), "claude-sonnet-5");
+        // Whitespace before the bracket is tolerated.
+        assert_eq!(normalize_model_id("claude-opus-5 [1m]"), "claude-opus-5");
+        // Untouched when there is no bracket — including ids that contain
+        // dots and dashes, which is all of them.
+        assert_eq!(normalize_model_id("claude-fable-5-1"), "claude-fable-5-1");
+        assert_eq!(normalize_model_id("gemini-3.8-flash"), "gemini-3.8-flash");
+        assert_eq!(normalize_model_id("auto"), "auto");
+        assert_eq!(normalize_model_id(""), "");
+    }
+
+    #[test]
+    fn bracketed_model_ids_resolve_against_the_registry() {
+        // The actual failure this prevents: find() misses the bracketed id,
+        // but resolves once normalized.
+        let e = RouteEngine::new();
+        assert!(e.find("claude-opus-5[1m]").is_err());
+        let m = e.find(normalize_model_id("claude-opus-5[1m]")).unwrap();
+        assert_eq!(m.api_id, "claude-opus-5");
+        assert_eq!(m.provider, Provider::Anthropic);
     }
 
     #[test]
