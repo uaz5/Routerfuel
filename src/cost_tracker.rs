@@ -220,7 +220,12 @@ impl CostTracker {
         model_name: String,
         token_cost: &TokenCostBreakdown,
         baseline_cost_cents: f64,
-        latency_ms: u64,
+        // Provider round-trip including generation. `None` on streaming
+        // paths, where the response is not complete until generation ends
+        // and so no such figure exists — pass `ttfb_ms` instead. See
+        // migration 010 for why this became nullable rather than being
+        // filled with time-to-headers.
+        latency_ms: Option<u64>,
         routing_decision_ms: u64,
         client_id: Option<String>,
         user_tier: Option<String>,
@@ -230,6 +235,11 @@ impl CostTracker {
         // Full handler wall-clock, where the caller can measure it. See
         // migration 009 for why this is Option rather than defaulting to 0.
         total_latency_ms: Option<u64>,
+        // Time-to-first-byte: upstream request sent -> headers received.
+        // Streaming paths only; `None` everywhere else. Deliberately not a
+        // substitute for `latency_ms` — the two measure different spans and
+        // conflating them is the defect migration 010 exists to fix.
+        ttfb_ms: Option<u64>,
     ) {
         // Log BEFORE variables get moved into tokio::spawn
         debug!(
@@ -261,6 +271,7 @@ impl CostTracker {
                 is_byok,
                 from_cache,
                 total_latency_ms,
+                ttfb_ms,
             )
             .await
             {
@@ -349,7 +360,9 @@ impl CostTracker {
         model_name: String,
         token_cost: TokenCostBreakdown,
         baseline_cost_cents: f64,
-        latency_ms: u64,
+        // `None` on streaming paths. Same principle as total_latency_ms
+        // below: never 0 as a stand-in. See migration 010.
+        latency_ms: Option<u64>,
         routing_decision_ms: u64,
         client_id: Option<String>,
         user_tier: Option<String>,
@@ -360,6 +373,8 @@ impl CostTracker {
         // measure it — never 0 as a stand-in, which would read as a real
         // measurement and skew AVG(). See migration 009.
         total_latency_ms: Option<u64>,
+        // Time-to-first-byte, streaming paths only. See migration 010.
+        ttfb_ms: Option<u64>,
     ) -> Result<(), CostTrackerError> {
         let cost_saved = baseline_cost_cents - token_cost.total_cost_cents;
 
@@ -372,10 +387,10 @@ impl CostTracker {
                 latency_ms, routing_decision_ms,
                 client_id, user_tier, priority,
                 is_byok, from_cache,
-                total_latency_ms,
+                total_latency_ms, ttfb_ms,
                 status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'success')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'success')
             "#,
         )
         .bind(&request_id)
@@ -385,7 +400,7 @@ impl CostTracker {
         .bind(token_cost.output_tokens as i32)
         .bind(token_cost.total_cost_cents)
         .bind(cost_saved)
-        .bind(latency_ms as i32)
+        .bind(latency_ms.map(|v| v as i32))
         .bind(routing_decision_ms as i32)
         .bind(&client_id)
         .bind(&user_tier)
@@ -393,6 +408,7 @@ impl CostTracker {
         .bind(is_byok)
         .bind(from_cache)
         .bind(total_latency_ms.map(|v| v as i32))
+        .bind(ttfb_ms.map(|v| v as i32))
         .execute(pool.as_ref())
         .await?;
 

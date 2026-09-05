@@ -597,12 +597,14 @@ async fn handle_non_streaming(
                 &token_cost,
                 baseline_cost.total_cost_cents,
                 // latency_ms is provider round-trip only, and a cache hit
-                // calls no provider — so 0 is the honest value here, not the
-                // wall-clock figure this used to record. NOTE: this lowers
-                // AVG(latency_ms) wherever cache hits exist; `from_cache`
-                // is already a column, so filter on it to compare
-                // like-for-like.
-                0,
+                // calls no provider — so there is no measurement to record.
+                // Now None rather than 0: migration 010 made the column
+                // nullable, which removes the caveat this comment used to
+                // carry (a stored 0 read as a real sub-millisecond provider
+                // call and dragged AVG(latency_ms) down wherever cache hits
+                // existed, so comparisons had to filter on `from_cache` to
+                // mean anything). NULL is skipped by AVG instead.
+                None,
                 0,
                 client_id,
                 None,
@@ -610,6 +612,8 @@ async fn handle_non_streaming(
                 true,
                 true, // from_cache
                 Some(cache_hit_latency_ms),
+                // Not a streaming path.
+                None,
             );
 
             return Ok(Json(cached_response));
@@ -891,7 +895,10 @@ async fn handle_non_streaming(
         response.model.clone(),
         &token_cost,
         baseline_cost.total_cost_cents,
-        latency_ms,
+        // A real, complete provider round-trip — the connector measured it
+        // across send-to-body-read, so it is the quantity latency_ms claims
+        // to hold. Contrast the streaming path, which passes None.
+        Some(latency_ms),
         routing_decision_ms,
         client_id,
         None,
@@ -899,6 +906,9 @@ async fn handle_non_streaming(
         true,
         false, // this is the real-provider-call path, not a cache hit
         Some(total_latency),
+        // Not a streaming path: time-to-first-byte is not meaningful when
+        // the whole body is read before the clock stops.
+        None,
     );
 
     info!(

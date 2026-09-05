@@ -164,23 +164,29 @@ pub async fn stream_handler(
                 model_api_id_clone,
                 &token_cost,
                 baseline_cost.total_cost_cents,
-                // DEFERRED (see migration 009): payload.latency_ms is
-                // stream_handler wall-clock, which conflates the provider
-                // call with the entire generation — a long stream reads as
-                // huge "provider latency". Splitting it needs a second
-                // Instant around just the upstream call and was scoped out
-                // of the latency-breakdown change. Until then both columns
-                // carry the same value, so overhead computes to 0 for
-                // streaming rows, which correctly signals "not yet
-                // separable" rather than "no overhead".
-                payload.latency_ms,
+                // RESOLVED (migration 010, closing 009's deferred gap).
+                //
+                // latency_ms is None, not a number: on a stream there is no
+                // "provider round-trip", because the response is not
+                // complete until generation ends — and that instant is what
+                // total_latency_ms already records. Previously this column
+                // got stream_handler wall-clock, so a long generation read
+                // as huge provider latency and dragged AVG(latency_ms) on
+                // the admin dashboard.
+                //
+                // The provider-only figure a stream *can* yield is
+                // time-to-headers, and it goes in ttfb_ms rather than here
+                // precisely because it measures a different span than the
+                // non-streaming column does.
+                None,
                 0,
                 client_id_clone,
                 None,
                 Some("streaming".to_string()),
                 is_byok,
                 false, // streaming never serves from the semantic cache
-                Some(payload.latency_ms),
+                Some(payload.total_latency_ms),
+                Some(payload.ttfb_ms),
             );
         } else {
             // FIX: audit_tx was dropped without ever sending — the stream
@@ -294,6 +300,14 @@ pub async fn stream_handler(
     let stream = try_stream! {
         let _permit = concurrency_limiter.acquire().await;
 
+        // Started AFTER acquiring the permit, deliberately. Time spent
+        // queueing for a concurrency slot is RouterFuel's own overhead, not
+        // the provider's; starting the clock above the acquire would bill
+        // gateway backpressure to the provider and make ttfb_ms rise under
+        // our own load. `start` (above) still covers the wait, so it shows
+        // up in total_latency_ms where it belongs.
+        let provider_start = Instant::now();
+
         let response = match http_req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -304,6 +318,10 @@ pub async fn stream_handler(
                 return;
             }
         };
+
+        // Headers are in — the only provider-only span a stream has.
+        // Everything from here on is generation time.
+        let ttfb_ms = provider_start.elapsed().as_millis() as u64;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -348,7 +366,8 @@ pub async fn stream_handler(
                     debug!(chunks = chunk_count, chars = full_text.len(), "Stream complete");
                     let _ = audit_tx.send(AuditPayload {
                         provider, input_tokens, output_tokens,
-                        latency_ms: start.elapsed().as_millis() as u64,
+                        total_latency_ms: start.elapsed().as_millis() as u64,
+                        ttfb_ms,
                     }).await;
                     yield Event::default().data("[DONE]");
                     return;
@@ -369,7 +388,8 @@ pub async fn stream_handler(
                             debug!(chunks = chunk_count, "Anthropic stream complete");
                             let _ = audit_tx.send(AuditPayload {
                                 provider, input_tokens, output_tokens,
-                                latency_ms: start.elapsed().as_millis() as u64,
+                                total_latency_ms: start.elapsed().as_millis() as u64,
+                                ttfb_ms,
                             }).await;
                             yield Event::default().data("[DONE]");
                             return;
@@ -442,7 +462,8 @@ pub async fn stream_handler(
         // partially-successful stream as a total failure.
         let _ = audit_tx.send(AuditPayload {
             provider, input_tokens, output_tokens,
-            latency_ms: start.elapsed().as_millis() as u64,
+            total_latency_ms: start.elapsed().as_millis() as u64,
+            ttfb_ms,
         }).await;
     };
 
@@ -458,7 +479,12 @@ struct AuditPayload {
     provider: Provider,
     input_tokens: u32,
     output_tokens: u32,
-    latency_ms: u64,
+    /// Full stream_handler wall-clock, measured from `start`.
+    total_latency_ms: u64,
+    /// Time-to-headers on the upstream call, measured from `provider_start`.
+    /// Renamed from the old `latency_ms` so the two spans cannot be swapped
+    /// at a call site by accident — see migration 010.
+    ttfb_ms: u64,
 }
 
 /// Parse Azure connection string for streaming (returns endpoint and api-key value)

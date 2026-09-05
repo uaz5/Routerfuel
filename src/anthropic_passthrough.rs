@@ -244,7 +244,7 @@ pub async fn messages_handler(
     // Unknown model => no rates => zero reservation. See the header note:
     // this is a deliberate trade so a model Anthropic has shipped but the
     // registry has not yet learned about stays usable.
-    let (rate_in, rate_out) = match state.route_engine.get_pricing(&model) {
+    let (rate_in, rate_out) = match state.route_engine.get_pricing_for(&model, estimated_input) {
         Ok(p) => p,
         Err(_) => {
             warn!(
@@ -341,8 +341,11 @@ pub async fn messages_handler(
         model.to_string(),
         &actual,
         client_id,
-        provider_start.elapsed().as_millis() as u64,
+        // Non-streaming: the body has been read, so this is a complete
+        // provider round-trip and belongs in latency_ms.
+        Some(provider_start.elapsed().as_millis() as u64),
         start.elapsed().as_millis() as u64,
+        None,
     );
 
     passthrough_response(status, upstream_bytes, false)
@@ -550,8 +553,11 @@ fn relay_stream(
             model,
             &actual,
             client_id,
-            provider_headers_ms,
+            // Streaming: no complete round-trip exists, so latency_ms stays
+            // NULL and the time-to-headers figure goes to ttfb_ms.
+            None,
             start.elapsed().as_millis() as u64,
+            Some(provider_headers_ms),
         );
     };
 
@@ -573,13 +579,21 @@ fn log_passthrough(
     model: String,
     cost: &TokenCostBreakdown,
     client_id: Option<String>,
-    // Provider round-trip only. On the streaming path this is time-to-
-    // headers, since the body arrives incrementally over the whole
-    // generation and lumping that in would repeat the mistake
-    // streaming.rs currently makes.
-    provider_ms: u64,
+    // Provider round-trip including generation — `Some` on the
+    // non-streaming path, `None` on the streaming one, where the body
+    // arrives incrementally and no such span exists.
+    //
+    // This used to be a single `provider_ms: u64` that the streaming caller
+    // filled with time-to-headers. The comment here acknowledged the two
+    // were different quantities but still put them in the same column;
+    // migration 010 adds ttfb_ms so they no longer have to share, and the
+    // two are split here so a caller cannot pass one where the other
+    // belongs.
+    provider_ms: Option<u64>,
     // Full handler wall-clock.
     total_ms: u64,
+    // Time-to-headers — `Some` on the streaming path only.
+    ttfb_ms: Option<u64>,
 ) {
     state.cost_tracker.record_request(
         request_id,
@@ -605,6 +619,7 @@ fn log_passthrough(
         true,  // is_byok — always, this endpoint has no other mode
         false, // from_cache — no semantic cache on the native path
         Some(total_ms),
+        ttfb_ms,
     );
 }
 
