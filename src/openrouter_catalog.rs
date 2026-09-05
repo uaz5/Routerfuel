@@ -132,6 +132,9 @@ fn to_model_config(m: OpenRouterModel) -> Option<ModelConfig> {
         // not routing eligibility.
         open_weight: false,
         enabled: true,
+        // OpenRouter's /models exposes flat per-token rates only, with no
+        // long-context break, so there is nothing to populate here.
+        long_context_tier: None,
     })
 }
 

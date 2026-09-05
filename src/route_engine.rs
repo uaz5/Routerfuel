@@ -72,6 +72,34 @@ pub struct ModelConfig {
     /// Open-weight model — can be self-hosted, not tied to one lab's API
     pub open_weight: bool,
     pub enabled: bool,
+    /// Price break that kicks in once a request's *input* is large enough.
+    ///
+    /// `None` for every model whose vendor charges one flat rate per
+    /// direction, which is almost all of them. See `PriceTier` for why this
+    /// is a multiplier over the base rates rather than a second pair of
+    /// absolute rates.
+    pub long_context_tier: Option<PriceTier>,
+}
+
+/// A long-context price break, expressed as multipliers over
+/// `ModelConfig`'s base rates.
+///
+/// Multipliers rather than a second pair of absolute rates so there is
+/// exactly one place a model's price lives: correcting a base rate (which
+/// happens — see the two Gemini corrections below) automatically carries
+/// through to the tiered rate instead of leaving a stale second copy that
+/// silently disagrees.
+///
+/// Note the asymmetry, which is the vendor's and not ours: the threshold is
+/// measured on *input* tokens but the multipliers apply to input and output
+/// alike, for the whole request. A request one token over the line costs
+/// `output_mult` more on every output token it goes on to generate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriceTier {
+    /// Applies when input tokens are *strictly greater* than this.
+    pub above_input_tokens: u32,
+    pub input_mult: f64,
+    pub output_mult: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -348,6 +376,37 @@ pub struct RouteEngine {
 }
 
 macro_rules! model {
+    // With a long-context price break. Must precede the plain arm below,
+    // since macro arms are matched in order.
+    (
+        api_id: $api_id:expr,
+        display_name: $display_name:expr,
+        provider: $provider:expr,
+        cost_in: $cost_in:expr,
+        cost_out: $cost_out:expr,
+        latency_ms: $latency_ms:expr,
+        quality: $quality:expr,
+        context: $context:expr,
+        vision: $vision:expr,
+        open_weight: $open_weight:expr,
+        enabled: $enabled:expr,
+        tier: $tier:expr $(,)?
+    ) => {
+        ModelConfig {
+            api_id: $api_id.into(),
+            display_name: $display_name.into(),
+            provider: $provider,
+            cost_per_1m_input: $cost_in,
+            cost_per_1m_output: $cost_out,
+            latency_ms: $latency_ms,
+            quality_score: $quality,
+            context_window: $context,
+            supports_vision: $vision,
+            open_weight: $open_weight,
+            enabled: $enabled,
+            long_context_tier: Some($tier),
+        }
+    };
     (
         api_id: $api_id:expr,
         display_name: $display_name:expr,
@@ -373,6 +432,7 @@ macro_rules! model {
             supports_vision: $vision,
             open_weight: $open_weight,
             enabled: $enabled,
+            long_context_tier: None,
         }
     };
 }
@@ -471,21 +531,45 @@ impl RouteEngine {
             //    most clients cannot call yet, and /v1/models (which uses
             //    list_enabled) does not advertise it. Flip to true on GA.
             //
-            // 2. The cost figures below are OpenAI's SHORT-context rates.
-            //    Astra is the first entry here with tiered pricing: above
-            //    ~272k input tokens OpenAI charges 2x input and 1.5x output
-            //    for the whole request ($20/$75 per 1M). ModelConfig has one
-            //    flat rate per direction and cannot express that, so on
-            //    requests past the threshold the router under-prices Astra —
-            //    which also means get_pricing() under-estimates and
-            //    SpendGuard under-reserves exactly where the amounts are
-            //    largest. Short-context rates are the right single value
-            //    (they cover almost all traffic), but see the note in
-            //    CHANGES/README: real tiered support needs a ModelConfig
-            //    change, not a different constant here.
+            // 2. The cost figures below are OpenAI's SHORT-context rates, and
+            //    `tier` now carries the long-context break that ModelConfig
+            //    previously could not express. OpenAI's model page states it
+            //    verbatim: "Prompts with more than 272K input tokens are
+            //    priced at 2x input and cache rates and 1.5x output for the
+            //    full request." get_pricing_for() applies it; plain
+            //    get_pricing() still returns the base rates, which is what
+            //    the display/reporting callers want.
+            //
+            //    Two further pricing axes remain unexpressed and are NOT
+            //    modelled here, deliberately: Fast mode (2x both directions,
+            //    $20/$100) and cache rates ($1/1M cached input, $12.50/1M
+            //    cache writes). Neither is reachable through RouterFuel
+            //    today — nothing sets a service tier and nothing tracks cache
+            //    hits per provider — so modelling them would be inventing
+            //    fields no caller can populate.
+            //
+            // 3. ASSUMPTION (docs-only, no authenticated request made):
+            //    context corrected 1_100_000 -> 1_050_000 to match OpenAI's
+            //    published "1,050,000 context window", which is also what the
+            //    gpt-5.6 family already carries here. The old figure would
+            //    have had select_reachable admit requests between 1.05M and
+            //    1.1M tokens that OpenAI then rejects — the failure mode the
+            //    GLM-5.3 note below argues against.
+            //
+            // 4. BLOCKER on flipping `enabled`, separate from GA: Astra
+            //    rejects custom `temperature` and `top_p` (OpenAI's migration
+            //    guidance is to remove both, and to omit `logprobs` on Chat
+            //    Completions). build_openai_compatible_body() in connectors.rs
+            //    forwards both whenever the client supplies them, so enabling
+            //    Astra today would 400 every request from a client that sets
+            //    a temperature — routine on an OpenAI-compatible surface.
+            //    Tool calling additionally requires the Responses API, which
+            //    RouterFuel does not speak. Enabling this needs per-model
+            //    parameter filtering built first; it is not a bool flip.
             model!(api_id: "gpt-6-astra", display_name: "GPT-6 Astra", provider: Provider::OpenAI,
-                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.99, context: 1_100_000,
-                vision: true, open_weight: false, enabled: false),
+                cost_in: 1000.0, cost_out: 5000.0, latency_ms: 340, quality: 0.99, context: 1_050_000,
+                vision: true, open_weight: false, enabled: false,
+                tier: PriceTier { above_input_tokens: 272_000, input_mult: 2.0, output_mult: 1.5 }),
 
             model!(api_id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", provider: Provider::OpenAI,
                 cost_in: 500.0, cost_out: 3000.0, latency_ms: 250, quality: 0.99, context: 1_050_000,
@@ -1131,9 +1215,38 @@ impl RouteEngine {
         ))
     }
 
+    /// Base rates, in cents per 1M tokens, ignoring any long-context tier.
+    ///
+    /// Correct for display, reporting, and cost comparisons between models.
+    /// For anything that has to match what the provider will actually bill —
+    /// a SpendGuard reservation or a post-call reconcile — use
+    /// `get_pricing_for`, which needs the request's input size to know which
+    /// tier applies.
     pub fn get_pricing(&self, api_id: &str) -> Result<(f64, f64)> {
         let m = self.find(api_id)?;
         Ok((m.cost_per_1m_input, m.cost_per_1m_output))
+    }
+
+    /// Rates for a request of a given input size, applying the model's
+    /// long-context tier when the input crosses its threshold.
+    ///
+    /// Identical to `get_pricing` for every model with no tier, which is all
+    /// but gpt-6-astra today — so callers can use this unconditionally
+    /// rather than branching on whether the selected model happens to have
+    /// tiered pricing.
+    ///
+    /// `input_tokens` must be the count that will actually be sent, i.e.
+    /// *after* supercompress has run. Both reservation call sites already
+    /// recompute it in that order.
+    pub fn get_pricing_for(&self, api_id: &str, input_tokens: u32) -> Result<(f64, f64)> {
+        let m = self.find(api_id)?;
+        Ok(match m.long_context_tier {
+            Some(t) if input_tokens > t.above_input_tokens => (
+                m.cost_per_1m_input * t.input_mult,
+                m.cost_per_1m_output * t.output_mult,
+            ),
+            _ => (m.cost_per_1m_input, m.cost_per_1m_output),
+        })
     }
 
     pub fn list_enabled(&self) -> Vec<ModelConfig> {
@@ -1655,7 +1768,9 @@ mod tests {
         // Nameable and priceable: a Trusted Access client can request it.
         let m = e.find("gpt-6-astra").unwrap();
         assert_eq!(m.provider, Provider::OpenAI);
-        assert_eq!(m.context_window, 1_100_000);
+        // Corrected from 1_100_000 — OpenAI publishes 1,050,000, the same
+        // window the gpt-5.6 family already carries here.
+        assert_eq!(m.context_window, 1_050_000);
         assert!(m.supports_vision);
         assert_eq!(e.get_pricing("gpt-6-astra").unwrap(), (1000.0, 5000.0));
         assert_eq!(
@@ -1689,5 +1804,125 @@ mod tests {
         // wrong the day OpenRouter renames something.
         assert_eq!(openrouter_slug_override("grok-4.6"), None);
         assert_eq!(openrouter_slug_override("claude-fable-5"), None);
+    }
+
+    #[test]
+    fn astra_long_context_tier_applies_only_above_the_threshold() {
+        let e = RouteEngine::new();
+
+        // Base rates below and at the threshold — the vendor's wording is
+        // "more than 272K", so 272_000 exactly is still short-context.
+        assert_eq!(e.get_pricing_for("gpt-6-astra", 0).unwrap(), (1000.0, 5000.0));
+        assert_eq!(e.get_pricing_for("gpt-6-astra", 272_000).unwrap(), (1000.0, 5000.0));
+
+        // One token over: 2x input, 1.5x output, for the whole request.
+        assert_eq!(
+            e.get_pricing_for("gpt-6-astra", 272_001).unwrap(),
+            (2000.0, 7500.0)
+        );
+
+        // get_pricing stays on the base rates regardless — it is the
+        // display/reporting accessor and has no input size to reason about.
+        assert_eq!(e.get_pricing("gpt-6-astra").unwrap(), (1000.0, 5000.0));
+    }
+
+    #[test]
+    fn models_without_a_tier_price_identically_either_way() {
+        // The property that lets callers use get_pricing_for
+        // unconditionally instead of branching on whether the selected
+        // model happens to have tiered pricing.
+        let e = RouteEngine::new();
+        for m in e.list_enabled() {
+            if m.long_context_tier.is_some() {
+                continue;
+            }
+            assert_eq!(
+                e.get_pricing_for(&m.api_id, 5_000_000).unwrap(),
+                e.get_pricing(&m.api_id).unwrap(),
+                "{} has no tier but priced differently at 5M input", m.api_id
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_preview_suffixed_ids_are_registered_under_their_real_names() {
+        // Both were sending an id generativelanguage 404s on. Google
+        // publishes the "-preview" form for each; the bare ids must be gone
+        // so a stale caller fails loudly at routing rather than silently at
+        // the provider.
+        let e = RouteEngine::new();
+
+        for id in ["gemini-3.1-pro-preview", "gemini-3-flash-preview"] {
+            let m = e.find(id).unwrap_or_else(|_| panic!("{id} missing"));
+            assert_eq!(m.provider, Provider::Gemini, "{id}");
+            assert!(m.enabled, "{id}");
+        }
+        assert!(e.find("gemini-3.1-pro").is_err());
+        assert!(e.find("gemini-3-flash").is_err());
+
+        // And with the ids corrected, the "{prefix}/{model}" formula reaches
+        // OpenRouter's real slugs unaided — so neither needs an override.
+        // The gemini-3-flash entry that used to live there is deleted.
+        assert_eq!(openrouter_slug_override("gemini-3-flash-preview"), None);
+        assert_eq!(openrouter_slug_override("gemini-3.1-pro-preview"), None);
+        assert_eq!(openrouter_slug_override("gemini-3-flash"), None);
+    }
+
+    #[test]
+    fn task_routing_answer_question_still_resolves_after_the_gemini_rename() {
+        // select_for_task looks its preferred model up by literal id, so a
+        // registry rename silently demotes the task to score-based fallback
+        // unless the table is updated with it.
+        let e = RouteEngine::new();
+        let d = e.select_for_task(MeetingTask::AnswerQuestion, 5_000, None).unwrap();
+        assert_eq!(d.model.api_id, "gemini-3-flash-preview");
+    }
+
+    #[test]
+    fn retired_and_unlisted_models_are_not_routable() {
+        // kimi-k2.5 was retired 2026-08-31 (404s); grok-4.1-fast's family
+        // was retired 2026-05-15; grok-code-fast-1 is absent from xAI's
+        // current list. All three were `enabled: true`, so auto/task routing
+        // could pick a model that cannot answer.
+        let e = RouteEngine::new();
+        for id in ["kimi-k2.5", "grok-4.1-fast", "grok-code-fast-1"] {
+            // Still findable, so historical request_logs rows resolve for
+            // pricing and display.
+            assert!(e.find(id).is_ok(), "{id} should remain in the registry");
+            assert!(!e.find(id).unwrap().enabled, "{id} must be disabled");
+            assert!(
+                !e.list_enabled().iter().any(|m| m.api_id == id),
+                "{id} must not be advertised by /v1/models"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_code_survives_grok_code_fast_1_being_disabled() {
+        // SIMPLE_CODE_MODELS still lists grok-code-fast-1 first; the loop
+        // gates on `enabled`, so this must fall through to codestral-2
+        // rather than returning a dead model or erroring.
+        let e = RouteEngine::new();
+        let shape = RequestShape { task: TaskKind::Code, difficulty: Difficulty::Simple };
+        let d = e.select_for_shape(shape, 300, 256, None).unwrap();
+        assert_eq!(d.model.api_id, "codestral-2");
+    }
+
+    #[test]
+    fn xai_context_windows_match_published_figures() {
+        // 4.5 and 4.20 were entered at 2M, a figure xAI publishes for
+        // neither — the effect was admitting 1M-2M requests xAI rejects.
+        let e = RouteEngine::new();
+        let ctx = |id: &str| e.find(id).unwrap().context_window;
+        assert_eq!(ctx("grok-4.6"), 500_000);
+        assert_eq!(ctx("grok-4.5"), 500_000);
+        assert_eq!(ctx("grok-4.3"), 1_000_000);
+        assert_eq!(ctx("grok-4.20"), 1_000_000);
+
+        // No enabled Grok claims more than 1M, so nothing in the family
+        // absorbs an overflow from the others.
+        for m in e.list_enabled().iter().filter(|m| m.provider == Provider::XAI) {
+            assert!(m.context_window <= 1_000_000, "{} claims {}", m.api_id, m.context_window);
+        }
     }
 }

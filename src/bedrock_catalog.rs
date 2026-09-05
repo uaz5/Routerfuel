@@ -114,6 +114,9 @@ fn to_model_config(m: BedrockModelSummary) -> Option<ModelConfig> {
         supports_vision,
         open_weight: false,
         enabled: true,
+        // Bedrock entries carry no rates at all here (see the 0.0 above), so
+        // a multiplier over them would be meaningless.
+        long_context_tier: None,
     })
 }
 

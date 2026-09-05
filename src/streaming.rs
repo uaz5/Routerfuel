@@ -135,8 +135,13 @@ pub async fn stream_handler(
 
     tokio::spawn(async move {
         if let Some(payload) = audit_rx.recv().await {
+            // get_pricing_for with the provider-reported input count: this
+            // is the reconcile side of main.rs's reservation, so it has to
+            // price the same tier the provider will bill. Using the flat
+            // rate here would reconcile a tiered request down to the base
+            // amount and hand back cap headroom that was really spent.
             let (cost_in, cost_out) = route_engine_clone
-                .get_pricing(&model_api_id_clone)
+                .get_pricing_for(&model_api_id_clone, payload.input_tokens)
                 .unwrap_or((500.0, 3000.0));
 
             let token_cost = TokenCostBreakdown::new(

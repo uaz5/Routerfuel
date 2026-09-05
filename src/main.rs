@@ -305,7 +305,14 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
     };
 
     // FIX: pricing + reservation, same pattern as handle_non_streaming.
-    let (cost_per_1m_input, cost_per_1m_output) = match state.route_engine.get_pricing(&routing_model_id) {
+    //
+    // get_pricing_for, not get_pricing: a model with a long-context price
+    // break (gpt-6-astra today) costs more per token above its threshold,
+    // and the reservation below is what has to match the real bill. Using
+    // the flat rate under-reserved by 2x input / 1.5x output on exactly the
+    // largest requests. Note this runs before supercompress, so it is
+    // re-derived below once the final input count is known.
+    let (cost_per_1m_input, cost_per_1m_output) = match state.route_engine.get_pricing_for(&routing_model_id, input_tokens) {
         Ok(p) => p,
         // BYOK-only providers (Azure/Bedrock): billed to the client's own
         // provider account, so RouterFuel has no rates to apply.
@@ -338,6 +345,16 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
         }
         None => input_tokens,
     };
+
+    // Re-price against the post-compression input count. Compression can
+    // carry a request back under a long-context threshold, and the
+    // reservation must price what is actually sent rather than what arrived.
+    // A no-op for every model without a tier, and the unwrap_or preserves
+    // the Azure/Bedrock zero-rate fallback resolved above.
+    let (cost_per_1m_input, cost_per_1m_output) = state
+        .route_engine
+        .get_pricing_for(&routing_model_id, input_tokens)
+        .unwrap_or((cost_per_1m_input, cost_per_1m_output));
 
     let estimated_output = tokens::estimate_output_tokens(request.max_tokens, &request.model);
     let estimated_cost = TokenCostBreakdown::new(input_tokens, estimated_output, cost_per_1m_input, cost_per_1m_output);
@@ -635,7 +652,9 @@ async fn handle_non_streaming(
         );
     }
 
-    let (cost_per_1m_input, cost_per_1m_output) = match state.route_engine.get_pricing(&routing_model_id) {
+    // get_pricing_for, not get_pricing — see the matching block in
+    // handle_streaming. Re-derived after compression below.
+    let (cost_per_1m_input, cost_per_1m_output) = match state.route_engine.get_pricing_for(&routing_model_id, input_tokens) {
         Ok(p) => p,
         // BYOK-only providers (Azure/Bedrock) have no registry entry and so no
         // known rates — the client is billed directly by their own Azure/AWS
@@ -670,6 +689,13 @@ async fn handle_non_streaming(
         }
         None => input_tokens,
     };
+
+    // Re-price against the post-compression input count — see the matching
+    // block in handle_streaming.
+    let (cost_per_1m_input, cost_per_1m_output) = state
+        .route_engine
+        .get_pricing_for(&routing_model_id, input_tokens)
+        .unwrap_or((cost_per_1m_input, cost_per_1m_output));
 
     let estimated_cost = TokenCostBreakdown::new(
         input_tokens,
@@ -1004,8 +1030,11 @@ fn maybe_fire_shadow_request(
         let shadow_input_tokens = tokens::count_request_tokens(&shadow_request.messages, &shadow_request.model)
             .unwrap_or(0);
         let shadow_estimated_output = tokens::estimate_output_tokens(shadow_request.max_tokens, &shadow_request.model);
+        // get_pricing_for: the shadow call is fully billed and reserved
+        // against the client's cap like any other, so a shadow at a
+        // tiered-pricing model must reserve at its tiered rate too.
         let (shadow_cost_in, shadow_cost_out) = route_engine
-            .get_pricing(&shadow_model_id)
+            .get_pricing_for(&shadow_model_id, shadow_input_tokens)
             .unwrap_or((500.0, 3000.0));
         let shadow_estimated_cost_cents = TokenCostBreakdown::new(
             shadow_input_tokens,
