@@ -94,7 +94,15 @@
 
   /* ---------- KPI + gauge row ---------- */
   .kpi-grid{
-    display:grid;grid-template-columns: 260px repeat(4, 1fr);gap:14px;margin-bottom:22px;
+    /* 260px gauge column + N equal KPI columns. Bumped 4 -> 5 when the
+       time-to-first-byte card arrived with migration 010, so the new card
+       lands on the top row rather than pushing an extra one down.
+       Pre-existing and unchanged: there are six KPI cards for five
+       columns, so the last one (total / gateway overhead) wraps to a
+       second row beneath the gauge. That was already true with five cards
+       in four columns. Raising this to 6 would put everything on one row
+       at the cost of narrowing all six. */
+    display:grid;grid-template-columns: 260px repeat(5, 1fr);gap:14px;margin-bottom:22px;
   }
   .card{
     background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
@@ -229,9 +237,14 @@
       <div class="kpi-sub" id="kpiCacheSub">&nbsp;</div>
     </div>
     <div class="card">
-      <div class="kpi-label">Avg provider latency / routing</div>
+      <div class="kpi-label">Avg provider latency <span class="dim">— non-streaming</span></div>
       <div class="kpi-value" id="kpiLatency">—</div>
       <div class="kpi-sub" id="kpiRouting">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">Avg time-to-first-byte <span class="dim">— streaming</span></div>
+      <div class="kpi-value" id="kpiTtfb">—</div>
+      <div class="kpi-sub" id="kpiTtfbSub">&nbsp;</div>
     </div>
     <div class="card">
       <div class="kpi-label">Avg total / gateway overhead</div>
@@ -405,12 +418,23 @@ async function loadOverview(){
   $('kpiSaved').textContent = `${fmtUsd(d.total_saved_usd)} saved · ${fmtInt(d.byok_requests)} BYOK`;
   $('kpiCache').textContent = d.cache_hit_rate_pct.toFixed(1) + '%';
   $('kpiCacheSub').textContent = `${fmtInt(d.cache_hits)} hits`;
+  // provider latency and TTFB are averages over DISJOINT row sets since
+  // migration 010 — latency_ms is NULL on streaming rows and ttfb_ms is
+  // NULL everywhere else — so each is shown with its own sample count.
+  // Without them, a mostly-streaming period displays a confident-looking
+  // provider latency that may rest on a handful of rows, and the two read
+  // as comparable when they measure different spans over different traffic.
   $('kpiLatency').textContent = fmtMs(d.avg_latency_ms);
-  $('kpiRouting').textContent = `routing ${d.avg_routing_ms.toFixed(1)}ms`;
+  $('kpiRouting').textContent =
+    `${fmtInt(d.latency_sample_count)} rows · routing ${d.avg_routing_ms.toFixed(1)}ms`;
+  $('kpiTtfb').textContent = d.ttfb_sample_count > 0 ? fmtMs(d.avg_ttfb_ms) : '—';
+  $('kpiTtfbSub').textContent = d.ttfb_sample_count > 0
+    ? `${fmtInt(d.ttfb_sample_count)} streaming rows`
+    : 'no streaming traffic in range';
   // Added with migration 009. Rows written before it have a NULL
   // total_latency_ms and are skipped by AVG, so a range spanning the
-  // deploy shows only instrumented traffic. Overhead reads 0 for
-  // streaming and error rows, where the two figures are not yet separable.
+  // deploy shows only instrumented traffic. Overhead is non-streaming-only
+  // for the same reason avg_latency_ms is: it subtracts latency_ms.
   $('kpiTotalLatency').textContent = fmtMs(d.avg_total_latency_ms);
   $('kpiOverhead').textContent = `gateway ${d.avg_overhead_ms.toFixed(1)}ms`;
   setGauge(d.total_saved_pct);

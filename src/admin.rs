@@ -151,6 +151,9 @@ pub struct OverviewResponse {
     pub total_spend_usd: f64,
     pub total_saved_usd: f64,
     pub total_saved_pct: f64,
+    /// Provider round-trip including generation. Since migration 010 this
+    /// is NULL on streaming rows, so AVG covers NON-STREAMING TRAFFIC ONLY.
+    /// `latency_sample_count` says how many rows that actually is.
     pub avg_latency_ms: f64,
     pub avg_routing_ms: f64,
     /// Full handler wall-clock. NULL in rows predating migration 009, and
@@ -158,9 +161,25 @@ pub struct OverviewResponse {
     /// only the instrumented rows.
     pub avg_total_latency_ms: f64,
     /// RouterFuel's own overhead: avg(total_latency_ms - latency_ms).
-    /// Reads 0 for streaming and error rows, where the two figures are not
-    /// yet separable — see migration 009.
+    /// NULL-and-therefore-skipped for streaming rows since migration 010,
+    /// because overhead is not computable without a comparable provider
+    /// figure — so like `avg_latency_ms` this describes non-streaming
+    /// traffic only.
     pub avg_overhead_ms: f64,
+    /// Time-to-first-byte, STREAMING TRAFFIC ONLY (NULL elsewhere). Added
+    /// with migration 010.
+    ///
+    /// Deliberately paired with its own count: this and `avg_latency_ms` are
+    /// averages over DISJOINT row sets, not two measurements of the same
+    /// population. Rendering them side by side without the counts invites
+    /// reading one as faster than the other, when a mostly-streaming period
+    /// can show a confident-looking provider latency drawn from a handful of
+    /// rows.
+    pub avg_ttfb_ms: f64,
+    /// Rows contributing to `avg_latency_ms` / `avg_overhead_ms`.
+    pub latency_sample_count: i64,
+    /// Rows contributing to `avg_ttfb_ms`.
+    pub ttfb_sample_count: i64,
     pub cache_hits: i64,
     pub cache_hit_rate_pct: f64,
     pub byok_requests: i64,
@@ -251,6 +270,13 @@ pub async fn overview_handler(
             COALESCE(AVG(routing_decision_ms), 0)::float8    AS avg_routing_ms,
             COALESCE(AVG(total_latency_ms), 0)::float8       AS avg_total_latency_ms,
             COALESCE(AVG(total_latency_ms - latency_ms), 0)::float8 AS avg_overhead_ms,
+            COALESCE(AVG(ttfb_ms), 0)::float8                AS avg_ttfb_ms,
+            -- COUNT(col) counts non-NULLs, which is the point: these report
+            -- how many rows each average is actually built from. The two are
+            -- disjoint by construction (migration 010), so a caller can tell
+            -- a meaningful figure from one row's worth of noise.
+            COUNT(latency_ms)                                AS latency_sample_count,
+            COUNT(ttfb_ms)                                   AS ttfb_sample_count,
             COUNT(*) FILTER (WHERE from_cache = TRUE)        AS cache_hits,
             COUNT(*) FILTER (WHERE is_byok = TRUE)           AS byok_requests
         FROM request_logs
@@ -293,6 +319,9 @@ pub async fn overview_handler(
                 avg_routing_ms: r.get("avg_routing_ms"),
                 avg_total_latency_ms: r.get("avg_total_latency_ms"),
                 avg_overhead_ms: r.get("avg_overhead_ms"),
+                avg_ttfb_ms: r.get("avg_ttfb_ms"),
+                latency_sample_count: r.get("latency_sample_count"),
+                ttfb_sample_count: r.get("ttfb_sample_count"),
                 cache_hits: hits,
                 cache_hit_rate_pct: hit_pct,
                 byok_requests: r.get("byok_requests"),
