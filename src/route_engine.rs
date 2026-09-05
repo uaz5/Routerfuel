@@ -198,7 +198,7 @@ const SIMPLE_MIN_QUALITY: f32 = 0.60;
 /// Cost weighting therefore ranks by *quality* on precisely the small
 /// requests we want to cheapen, and only starts behaving like its name at
 /// around 1 cent per request. Measured: without this ceiling, a simple
-/// request picks gemini-3-flash (50+300 = 350 blended) over
+/// request picks gemini-3-flash-preview (50+300 = 350 blended) over
 /// deepseek-v4-flash (14+28 = 42) — an 8x price difference in the wrong
 /// direction.
 ///
@@ -229,6 +229,12 @@ impl SelectionLimits {
 }
 
 /// Cheap, code-tuned models preferred for `Simple` + `Code`, in order.
+///
+/// grok-code-fast-1 stays listed first but is now a disabled registry entry
+/// (absent from xAI's model list — see build_registry), so in practice this
+/// resolves to codestral-2. The loop below already gates on `enabled`, so
+/// leaving it here is harmless and keeps the preference order recorded for
+/// whenever xAI's catalog is re-checked.
 /// A short explicit list rather than a scored field, for the same reason
 /// `select_for_task` keeps a preferred-model fast path: these are the only
 /// registry entries with a real task specialization, and inventing a
@@ -385,9 +391,16 @@ impl RouteEngine {
     /// "{prefix}/{model}" formula. resolve_byok_route in main.rs uses this
     /// to verify a guessed OpenRouter slug before sending it, instead of
     /// trusting the formula blindly — this is the same class of bug that
-    /// broke gemini-3-flash (OpenRouter's real slug needed a "-preview"
+    /// broke Gemini 3 Flash (OpenRouter's real slug needed a "-preview"
     /// suffix the formula didn't produce), just generalized into a check
     /// instead of a single hand-added exception.
+    ///
+    /// Note this guards the OpenRouter path only. There is no equivalent
+    /// check on the direct path — nothing validates a curated api_id against
+    /// the vendor's own model list, which is why the Gemini and xAI errors
+    /// corrected in build_registry went unnoticed. A startup reconciliation
+    /// against each provider's GET /models would close that gap; tracked
+    /// separately.
     pub fn openrouter_catalog_has(&self, candidate: &str) -> bool {
         self.models
             .read()
@@ -510,7 +523,15 @@ impl RouteEngine {
             // GOOGLE GEMINI — POST https://generativelanguage.googleapis.com/
             //   v1beta/models/{model_id}:generateContent?key={API_KEY}
             // ================================================================
-            model!(api_id: "gemini-3.1-pro", display_name: "Gemini 3.1 Pro", provider: Provider::Gemini,
+            // ASSUMPTION (docs-only, no authenticated request made): renamed
+            // "gemini-3.1-pro" -> "gemini-3.1-pro-preview". Google's model
+            // list publishes the "-preview" form and the bare id appears
+            // nowhere in current docs, so the direct path was sending an id
+            // generativelanguage would 404 on. Same class as the
+            // gemini-3-flash rename below. display_name deliberately keeps
+            // the marketing name — the suffix is an API detail, not something
+            // to surface on the dashboard.
+            model!(api_id: "gemini-3.1-pro-preview", display_name: "Gemini 3.1 Pro", provider: Provider::Gemini,
                 cost_in: 200.0, cost_out: 1200.0, latency_ms: 210, quality: 0.96, context: 2_000_000,
                 vision: true, open_weight: false, enabled: true),
 
@@ -543,7 +564,24 @@ impl RouteEngine {
                 cost_in: 30.0, cost_out: 250.0, latency_ms: 75, quality: 0.74, context: 1_048_576,
                 vision: true, open_weight: false, enabled: true),
 
-            model!(api_id: "gemini-3-flash", display_name: "Gemini 3 Flash", provider: Provider::Gemini,
+            // ASSUMPTION (docs-only, no authenticated request made): renamed
+            // "gemini-3-flash" -> "gemini-3-flash-preview".
+            //
+            // This id was already known to need the "-preview" suffix — that
+            // is what openrouter_slug_override was added for — but the fix
+            // landed on the OpenRouter axis only. The DIRECT path sends
+            // api_id verbatim into the generativelanguage URL (see
+            // GeminiConnector::complete), so a client with a direct Gemini
+            // key has been getting a 404 this whole time while a client on an
+            // OpenRouter key was fine. The override table could never have
+            // masked that: it is consulted only when the client has no direct
+            // key for the provider.
+            //
+            // Renaming here makes the OpenRouter override redundant — the
+            // "{prefix}/{model}" formula now yields the real slug
+            // "google/gemini-3-flash-preview" on its own — so that entry is
+            // deleted below rather than left as a no-op.
+            model!(api_id: "gemini-3-flash-preview", display_name: "Gemini 3 Flash", provider: Provider::Gemini,
                 cost_in: 50.0, cost_out: 300.0, latency_ms: 105, quality: 0.85, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
@@ -569,16 +607,24 @@ impl RouteEngine {
             // xAI GROK — POST https://api.x.ai/v1/chat/completions
             // OpenAI-compatible schema
             // ================================================================
-            // 500k context is a step *down* from grok-4.5/4.20's 2M, so
-            // inputs above 500k tokens fall through to the older Groks
-            // rather than to this one — that's the context filter in
-            // select_reachable working as intended, not a misconfiguration.
+            // Context corrected across this block against xAI's published
+            // model pages. 4.6 and 4.5 are both 500k; 4.3 and 4.20 are both
+            // 1M. The previous entries had 4.5 and 4.20 at 2M, which is not a
+            // figure xAI publishes for either — the effect was
+            // select_reachable admitting 1M–2M-token requests that xAI then
+            // rejects. Prices were already right ($2/$6 for 4.5, $1.25/$2.50
+            // for 4.20), so only the windows moved.
+            //
+            // Note this removes the tier inversion the old comment here
+            // described: no Grok has a larger window than 4.3/4.20's 1M, so
+            // inputs above 1M no longer fall through to an "older Grok" —
+            // they leave the xAI family entirely.
             model!(api_id: "grok-4.6", display_name: "Grok 4.6", provider: Provider::XAI,
                 cost_in: 200.0, cost_out: 600.0, latency_ms: 200, quality: 0.96, context: 500_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "grok-4.5", display_name: "Grok 4.5", provider: Provider::XAI,
-                cost_in: 200.0, cost_out: 600.0, latency_ms: 190, quality: 0.93, context: 2_000_000,
+                cost_in: 200.0, cost_out: 600.0, latency_ms: 190, quality: 0.93, context: 500_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "grok-4.3", display_name: "Grok 4.3", provider: Provider::XAI,
@@ -586,16 +632,33 @@ impl RouteEngine {
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "grok-4.20", display_name: "Grok 4.20", provider: Provider::XAI,
-                cost_in: 125.0, cost_out: 250.0, latency_ms: 165, quality: 0.88, context: 2_000_000,
+                cost_in: 125.0, cost_out: 250.0, latency_ms: 165, quality: 0.88, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
-            model!(api_id: "grok-4.1-fast", display_name: "Grok 4.1 Fast", provider: Provider::XAI,
+            // DISABLED, not deleted: this id is absent from xAI's current
+            // model list, and xAI's retirement notice says the
+            // `grok-4-1-fast` family stopped serving on 2026-05-15 and now
+            // redirects to grok-4.3. So every request the router sent here
+            // was either a 404 or a silent substitution billed at another
+            // model's rates. Kept as a disabled row so `find()` still
+            // resolves it for pricing/display on historical request_logs
+            // instead of turning old rows into "unknown model".
+            //
+            // Note the id here is also suspect independently of retirement:
+            // xAI wrote it "grok-4-1-fast" (dashes), not "grok-4.1-fast".
+            model!(api_id: "grok-4.1-fast", display_name: "Grok 4.1 Fast (retired)", provider: Provider::XAI,
                 cost_in: 20.0, cost_out: 50.0, latency_ms: 90, quality: 0.75, context: 2_000_000,
-                vision: false, open_weight: false, enabled: true),
+                vision: false, open_weight: false, enabled: false),
 
-            model!(api_id: "grok-code-fast-1", display_name: "Grok Code Fast 1", provider: Provider::XAI,
+            // DISABLED for the same reason: not present in xAI's current
+            // model list. Unlike grok-4.1-fast there is no explicit
+            // retirement notice naming it, so "gone" is inferred from absence
+            // rather than stated — but SIMPLE_CODE_MODELS listed this first,
+            // meaning every Simple+Code request was being aimed at it. That
+            // path checks `enabled`, so it now falls through to codestral-2.
+            model!(api_id: "grok-code-fast-1", display_name: "Grok Code Fast 1 (unlisted)", provider: Provider::XAI,
                 cost_in: 20.0, cost_out: 150.0, latency_ms: 100, quality: 0.78, context: 256_000,
-                vision: false, open_weight: false, enabled: true),
+                vision: false, open_weight: false, enabled: false),
 
             // ================================================================
             // DEEPSEEK — POST https://api.deepseek.com/v1/chat/completions
@@ -617,6 +680,23 @@ impl RouteEngine {
             // MISTRAL — POST https://api.mistral.ai/v1/chat/completions
             // OpenAI-compatible schema
             // ================================================================
+            // SUSPECT api_ids — all four, NOT renamed pending a source.
+            //
+            // Every id in this block is a bare marketing name. Mistral's API
+            // does not appear to accept those: its docs consistently key
+            // models by date code (mistral-large-2512, mistral-small-2503,
+            // codestral-2501, ministral-8b-2410) or by a "-latest" alias
+            // (mistral-small-latest). If that is right, all four of these are
+            // 404s on the direct path — the same defect as the two Gemini ids
+            // corrected above, and the largest single cluster left.
+            //
+            // Left alone on purpose: the docs pass that turned these up read
+            // Mistral's *deprecation* table, which names replacement ids
+            // without confirming which alias form the API accepts, and
+            // picking between "-latest" (floats, so pricing here goes stale
+            // silently) and a pinned date code (needs the current code, which
+            // that table does not give) is a real decision rather than a
+            // rename. Tracked as its own task; do not guess these.
             model!(api_id: "mistral-large-3", display_name: "Mistral Large 3", provider: Provider::Mistral,
                 cost_in: 50.0, cost_out: 150.0, latency_ms: 165, quality: 0.86, context: 128_000,
                 vision: true, open_weight: false, enabled: true),
@@ -661,9 +741,14 @@ impl RouteEngine {
                 cost_in: 95.0, cost_out: 400.0, latency_ms: 175, quality: 0.89, context: 256_000,
                 vision: true, open_weight: true, enabled: true),
 
-            model!(api_id: "kimi-k2.5", display_name: "Kimi K2.5", provider: Provider::Moonshot,
+            // DISABLED: Moonshot retired the kimi-k2.5 and moonshot-v1 series
+            // on 2026-08-31; calls now return 404 model-not-found. This was
+            // registered `enabled: true`, so auto/task routing could and did
+            // pick a model that cannot answer. Kept as a disabled row so
+            // historical request_logs still resolve for pricing and display.
+            model!(api_id: "kimi-k2.5", display_name: "Kimi K2.5 (retired)", provider: Provider::Moonshot,
                 cost_in: 60.0, cost_out: 250.0, latency_ms: 170, quality: 0.84, context: 262_000,
-                vision: true, open_weight: true, enabled: true),
+                vision: true, open_weight: true, enabled: false),
 
             // ================================================================
             // ZHIPU / GLM — POST https://open.bigmodel.cn/api/paas/v4/chat/completions
@@ -700,6 +785,21 @@ impl RouteEngine {
             // META LLAMA — POST https://api.llama.com/v1/chat/completions
             // OpenAI-compatible schema — open-weight
             // ================================================================
+            // SUSPECT api_ids — all three, NOT renamed pending a source.
+            //
+            // These read like OpenRouter slugs with the vendor prefix
+            // stripped ("meta-llama/llama-4-maverick" -> "llama-4-maverick").
+            // Meta's own API appears to key models by the full checkpoint
+            // name instead — e.g. Llama-4-Maverick-17B-128E-Instruct-FP8 —
+            // which would make the bare lowercase form a 404 on the direct
+            // path while working fine for any client on an OpenRouter key.
+            // Exactly the shape of the gemini-3-flash bug.
+            //
+            // Not renamed because the checkpoint names found so far came from
+            // third-party model catalogs rather than api.llama.com, and the
+            // precision/variant suffix (FP8 vs BF16, 128E) changes which
+            // deployment you get — too consequential to infer. Tracked as its
+            // own task alongside the Mistral block.
             model!(api_id: "llama-4-maverick", display_name: "Llama 4 Maverick", provider: Provider::Meta,
                 cost_in: 20.0, cost_out: 60.0, latency_ms: 150, quality: 0.83, context: 1_000_000,
                 vision: true, open_weight: true, enabled: true),
@@ -929,7 +1029,7 @@ impl RouteEngine {
     ) -> Result<RoutingDecision> {
         let (priority, preferred) = match task {
             MeetingTask::Summarise          => (RoutingPriority::Balanced, "claude-sonnet-5"),
-            MeetingTask::AnswerQuestion      => (RoutingPriority::Speed,    "gemini-3-flash"),
+            MeetingTask::AnswerQuestion      => (RoutingPriority::Speed,    "gemini-3-flash-preview"),
             MeetingTask::ExtractActionItems  => (RoutingPriority::Cost,     "deepseek-v4-flash"),
             MeetingTask::DraftResponse       => (RoutingPriority::Quality,  "claude-opus-5"),
             MeetingTask::Classify            => (RoutingPriority::Cost,     "gemini-3.1-flash-lite"),
@@ -1080,9 +1180,29 @@ pub fn normalize_model_id(model: &str) -> &str {
     }
 }
 
+/// Maps a direct-path api_id to OpenRouter's real slug, for the cases where
+/// resolve_byok_route's "{prefix}/{model}" formula guesses wrong.
+///
+/// Scope worth being precise about, because it was previously misread as a
+/// general api_id patch list: this table affects the OPENROUTER path only,
+/// and is consulted only when the client supplied no direct key for the
+/// selected provider. It cannot correct — or hide — a wrong direct api_id.
+/// A model whose direct id is wrong needs the registry entry fixed; see the
+/// gemini-3-flash-preview note in build_registry for the case where fixing
+/// only this table left the direct path broken for months.
+///
+/// Corollary: an entry here is only ever needed when the vendor's own id and
+/// OpenRouter's slug genuinely disagree *after* the prefix is applied. Once a
+/// registry id is corrected to match the vendor, its entry here usually
+/// becomes derivable and should be deleted rather than kept as a no-op.
 pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
     match direct_api_id {
-        "gemini-3-flash" => Some("google/gemini-3-flash-preview"),
+        // The "gemini-3-flash" entry that used to sit here is gone: the
+        // registry id is now "gemini-3-flash-preview", so the formula
+        // produces OpenRouter's real "google/gemini-3-flash-preview"
+        // unaided. Keeping it would have been a no-op that also implied the
+        // direct id was still the bare form.
+        //
         // Anthropic's own API ids dash-separate the minor version
         // ("claude-fable-5-1"), but OpenRouter's slug keeps the dot
         // ("anthropic/claude-fable-5.1"), so resolve_byok_route's
@@ -1097,6 +1217,8 @@ pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
         // carries the dot, so the formula yields the correct
         // "x-ai/grok-4.6".
         "claude-fable-5-1" => Some("anthropic/claude-fable-5.1"),
+        // gemini-3.1-pro-preview needs no entry: like the flash rename, the
+        // formula now yields "google/gemini-3.1-pro-preview" directly.
         _ => None,
     }
 }
@@ -1165,7 +1287,7 @@ mod tests {
         let e = RouteEngine::new();
         assert!(e.is_vision_capable("claude-opus-5"));
         assert!(e.is_vision_capable("gpt-5.6-sol"));
-        assert!(e.is_vision_capable("gemini-3.1-pro"));
+        assert!(e.is_vision_capable("gemini-3.1-pro-preview"));
         assert!(!e.is_vision_capable("deepseek-v4-flash"));
         assert!(!e.is_vision_capable("grok-4.1-fast"));
     }

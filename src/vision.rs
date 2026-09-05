@@ -291,7 +291,7 @@ mod tests {
         let engine = RouteEngine::new();
         assert!(engine.is_vision_capable("claude-opus-4-8"));
         assert!(engine.is_vision_capable("gpt-5.6-sol"));
-        assert!(engine.is_vision_capable("gemini-3.1-pro"));
+        assert!(engine.is_vision_capable("gemini-3.1-pro-preview"));
         assert!(!engine.is_vision_capable("deepseek-v4-flash"));
     }
 

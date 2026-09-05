@@ -176,7 +176,7 @@ mod tests {
 
     #[test] fn estimate_defaults_by_model() {
         assert_eq!(estimate_output_tokens(None, "claude-opus-4-7"), 2048);
-        assert_eq!(estimate_output_tokens(None, "gemini-3-flash"),  512);
+        assert_eq!(estimate_output_tokens(None, "gemini-3-flash-preview"),  512);
     }
 
     #[test] fn survives_a_poisoned_lock() {
