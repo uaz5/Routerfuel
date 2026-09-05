@@ -514,20 +514,51 @@ impl RouteEngine {
                 cost_in: 200.0, cost_out: 1200.0, latency_ms: 210, quality: 0.96, context: 2_000_000,
                 vision: true, open_weight: false, enabled: true),
 
+            // The 3.6/3.7/3.8 Flash line all price identically (75/375) and
+            // sit on the same 1,048,576-token window; they differ only in
+            // generation, so quality is stepped 0.88/0.89/0.90 to keep the
+            // newest preferred without disturbing anything else.
+            model!(api_id: "gemini-3.8-flash", display_name: "Gemini 3.8 Flash", provider: Provider::Gemini,
+                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.90, context: 1_048_576,
+                vision: true, open_weight: false, enabled: true),
+
+            model!(api_id: "gemini-3.7-flash", display_name: "Gemini 3.7 Flash", provider: Provider::Gemini,
+                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.89, context: 1_048_576,
+                vision: true, open_weight: false, enabled: true),
+
+            model!(api_id: "gemini-3.6-flash", display_name: "Gemini 3.6 Flash", provider: Provider::Gemini,
+                cost_in: 75.0, cost_out: 375.0, latency_ms: 115, quality: 0.88, context: 1_048_576,
+                vision: true, open_weight: false, enabled: true),
+
+            // Corrected: this entry carried 75/450, but Google's current
+            // list price is 150/900 — the 3.6/3.7/3.8 Flash models above are
+            // what costs 75/375 now. Left uncorrected, the router would rank
+            // 3.5 Flash as comparable to its successors while it is actually
+            // twice the price.
             model!(api_id: "gemini-3.5-flash", display_name: "Gemini 3.5 Flash", provider: Provider::Gemini,
-                cost_in: 75.0, cost_out: 450.0, latency_ms: 120, quality: 0.87, context: 1_000_000,
+                cost_in: 150.0, cost_out: 900.0, latency_ms: 120, quality: 0.87, context: 1_000_000,
+                vision: true, open_weight: false, enabled: true),
+
+            model!(api_id: "gemini-3.5-flash-lite", display_name: "Gemini 3.5 Flash-Lite", provider: Provider::Gemini,
+                cost_in: 30.0, cost_out: 250.0, latency_ms: 75, quality: 0.74, context: 1_048_576,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gemini-3-flash", display_name: "Gemini 3 Flash", provider: Provider::Gemini,
                 cost_in: 50.0, cost_out: 300.0, latency_ms: 105, quality: 0.85, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
+            // Corrected: this entry carried 10/40, which is 2.5 Flash-Lite's
+            // price, not 3.1's. Google lists 3.1 Flash-Lite at 25/150.
             model!(api_id: "gemini-3.1-flash-lite", display_name: "Gemini 3.1 Flash-Lite", provider: Provider::Gemini,
-                cost_in: 10.0, cost_out: 40.0, latency_ms: 70, quality: 0.68, context: 1_000_000,
+                cost_in: 25.0, cost_out: 150.0, latency_ms: 70, quality: 0.68, context: 1_000_000,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gemini-2.5-pro", display_name: "Gemini 2.5 Pro", provider: Provider::Gemini,
                 cost_in: 125.0, cost_out: 1000.0, latency_ms: 200, quality: 0.89, context: 1_000_000,
+                vision: true, open_weight: false, enabled: true),
+
+            model!(api_id: "gemini-2.5-flash", display_name: "Gemini 2.5 Flash", provider: Provider::Gemini,
+                cost_in: 30.0, cost_out: 250.0, latency_ms: 110, quality: 0.78, context: 1_048_576,
                 vision: true, open_weight: false, enabled: true),
 
             model!(api_id: "gemini-2.5-flash-lite", display_name: "Gemini 2.5 Flash-Lite", provider: Provider::Gemini,
@@ -638,6 +669,29 @@ impl RouteEngine {
             // ZHIPU / GLM — POST https://open.bigmodel.cn/api/paas/v4/chat/completions
             // OpenAI-compatible schema
             // ================================================================
+            // GLM-5.3 — Zhipu's current flagship. Two conservative calls
+            // here, both erring toward "won't be picked" rather than "picked
+            // and fails":
+            //
+            //   context: sources disagree — OpenRouter's catalog reports
+            //   1,310,720 while Zhipu's own materials say 1M. Understating
+            //   only means very large requests route elsewhere; overstating
+            //   means accepting a request the provider then rejects. 1M it
+            //   is until confirmed from Zhipu's docs directly.
+            //
+            //   vision: false — Zhipu ships vision as separate "-v" variants
+            //   (glm-4.5v, glm-4.6v, glm-5v-turbo) and OpenRouter reports no
+            //   image modality on plain glm-5.3, though some write-ups claim
+            //   vision. False keeps vision.rs from routing images at a model
+            //   that may reject them.
+            //
+            //   open_weight: false unlike glm-5 above — GLM's older releases
+            //   are open-weight but I found no weight release for 5.3. This
+            //   only affects display/filtering, never routing.
+            model!(api_id: "glm-5.3", display_name: "GLM-5.3", provider: Provider::Zhipu,
+                cost_in: 140.0, cost_out: 440.0, latency_ms: 200, quality: 0.92, context: 1_000_000,
+                vision: false, open_weight: false, enabled: true),
+
             model!(api_id: "glm-5", display_name: "GLM-5", provider: Provider::Zhipu,
                 cost_in: 57.0, cost_out: 258.0, latency_ms: 180, quality: 0.86, context: 200_000,
                 vision: false, open_weight: true, enabled: true),
@@ -1368,6 +1422,63 @@ mod tests {
         only_mistral.insert(Provider::Mistral);
         let shape = RequestShape { task: TaskKind::General, difficulty: Difficulty::Simple };
         assert!(e.select_for_shape(shape, 300, 256, Some(&only_mistral)).is_ok());
+    }
+
+    #[test]
+    fn newly_added_google_and_zhipu_models_are_registered() {
+        let e = RouteEngine::new();
+
+        // (api_id, cost_in, cost_out, context)
+        let expected = [
+            ("gemini-3.8-flash", 75.0, 375.0, 1_048_576u32),
+            ("gemini-3.7-flash", 75.0, 375.0, 1_048_576),
+            ("gemini-3.6-flash", 75.0, 375.0, 1_048_576),
+            ("gemini-3.5-flash-lite", 30.0, 250.0, 1_048_576),
+            ("gemini-2.5-flash", 30.0, 250.0, 1_048_576),
+        ];
+        for (id, cin, cout, ctx) in expected {
+            let m = e.find(id).unwrap_or_else(|_| panic!("{id} missing"));
+            assert_eq!(m.provider, Provider::Gemini, "{id}");
+            assert_eq!(e.get_pricing(id).unwrap(), (cin, cout), "{id}");
+            assert_eq!(m.context_window, ctx, "{id}");
+            assert!(m.supports_vision, "{id} should accept image input");
+        }
+
+        let glm = e.find("glm-5.3").unwrap();
+        assert_eq!(glm.provider, Provider::Zhipu);
+        assert_eq!(e.get_pricing("glm-5.3").unwrap(), (140.0, 440.0));
+        assert!(!glm.supports_vision, "vision ships as separate -v variants");
+    }
+
+    #[test]
+    fn corrected_gemini_prices_do_not_undercut_their_successors() {
+        // 3.5 Flash used to be entered at 75/450, cheaper-looking than the
+        // 3.6/3.7/3.8 Flash models that actually replaced it at 75/375.
+        let e = RouteEngine::new();
+        let blended = |id: &str| {
+            let m = e.find(id).unwrap();
+            m.cost_per_1m_input + m.cost_per_1m_output
+        };
+        assert!(blended("gemini-3.5-flash") > blended("gemini-3.8-flash"));
+        // And 3.1 Flash-Lite must no longer share 2.5 Flash-Lite's price.
+        assert!(blended("gemini-3.1-flash-lite") > blended("gemini-2.5-flash-lite"));
+    }
+
+    #[test]
+    fn newly_added_models_need_no_openrouter_slug_override() {
+        // Their ids already produce the correct "{prefix}/{model}" slug, so
+        // an override entry would be dead weight. Verified against
+        // OpenRouter's live catalog.
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash",
+            "glm-5.3",
+        ] {
+            assert_eq!(openrouter_slug_override(id), None, "{id}");
+        }
     }
 
     #[test]
