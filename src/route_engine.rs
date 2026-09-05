@@ -156,7 +156,7 @@ impl std::str::FromStr for MeetingTask {
 /// Deliberately only two. `ModelConfig` has no per-model task-suitability
 /// field (`supports_vision` is the only capability flag), so `Code` is the
 /// one bucket with genuinely distinct targets in the registry —
-/// `grok-code-fast-1` and `codestral-2`. A `Creative` bucket was considered
+/// `grok-code-fast-1` and `codestral-2508`. A `Creative` bucket was considered
 /// and dropped: nothing in the registry serves it differently from
 /// `General`, so it would have detected poorly and then routed identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +260,7 @@ impl SelectionLimits {
 ///
 /// grok-code-fast-1 stays listed first but is now a disabled registry entry
 /// (absent from xAI's model list — see build_registry), so in practice this
-/// resolves to codestral-2. The loop below already gates on `enabled`, so
+/// resolves to codestral-2508. The loop below already gates on `enabled`, so
 /// leaving it here is harmless and keeps the preference order recorded for
 /// whenever xAI's catalog is re-checked.
 /// A short explicit list rather than a scored field, for the same reason
@@ -269,7 +269,7 @@ impl SelectionLimits {
 /// `code_score` for all ~45 curated entries (plus a default for the ~300
 /// OpenRouter catalog entries merged at startup) would be far more invented
 /// numbers than this earns.
-const SIMPLE_CODE_MODELS: &[&str] = &["grok-code-fast-1", "codestral-2"];
+const SIMPLE_CODE_MODELS: &[&str] = &["grok-code-fast-1", "codestral-2508"];
 
 /// Substrings that mark a request as coding work. Matched case-insensitively.
 ///
@@ -764,36 +764,48 @@ impl RouteEngine {
             // MISTRAL — POST https://api.mistral.ai/v1/chat/completions
             // OpenAI-compatible schema
             // ================================================================
-            // SUSPECT api_ids — all four, NOT renamed pending a source.
+            // ASSUMPTION (docs-only, no authenticated request made): all four
+            // ids renamed from bare marketing names to Mistral's dated ids,
+            // quoted verbatim from Mistral's own changelog:
             //
-            // Every id in this block is a bare marketing name. Mistral's API
-            // does not appear to accept those: its docs consistently key
-            // models by date code (mistral-large-2512, mistral-small-2503,
-            // codestral-2501, ministral-8b-2410) or by a "-latest" alias
-            // (mistral-small-latest). If that is right, all four of these are
-            // 404s on the direct path — the same defect as the two Gemini ids
-            // corrected above, and the largest single cluster left.
+            //   mistral-large-3 -> mistral-large-2512
+            //   mistral-small-4 -> mistral-small-2603
+            //   codestral-2     -> codestral-2508
+            //   ministral-8b    -> ministral-8b-2512
             //
-            // Left alone on purpose: the docs pass that turned these up read
-            // Mistral's *deprecation* table, which names replacement ids
-            // without confirming which alias form the API accepts, and
-            // picking between "-latest" (floats, so pricing here goes stale
-            // silently) and a pinned date code (needs the current code, which
-            // that table does not give) is a real decision rather than a
-            // rename. Tracked as its own task; do not guess these.
-            model!(api_id: "mistral-large-3", display_name: "Mistral Large 3", provider: Provider::Mistral,
+            // Mistral's API keys models by date code; the bare names were
+            // product labels, not ids, so all four were 404s on the direct
+            // path. Same defect class as the two Gemini ids.
+            //
+            // Dated ids rather than the "-latest" aliases that also exist
+            // (mistral-large-latest and friends), because every entry here
+            // carries hand-tuned cost/quality/context for one specific
+            // release. A floating alias invalidates all three silently the
+            // day Mistral rolls it — and the changelog shows codestral-latest
+            // having pointed at an older build than the then-current release,
+            // which is that failure mode already happening once.
+            //
+            // NOT re-verified: the cost/latency/quality/context figures below
+            // are the ones the old bare-name entries carried. The ids are now
+            // right; the numbers are inherited on the assumption that these
+            // are the same releases those figures were written for. That is
+            // shakiest for mistral-small-2603, which the changelog calls "a
+            // hybrid model unifying instruct, reasoning, and coding" -- not
+            // obviously the model a 0.72 quality score was chosen for. Worth
+            // a pricing pass; renaming does not settle it.
+            model!(api_id: "mistral-large-2512", display_name: "Mistral Large 3", provider: Provider::Mistral,
                 cost_in: 50.0, cost_out: 150.0, latency_ms: 165, quality: 0.86, context: 128_000,
                 vision: true, open_weight: false, enabled: true),
 
-            model!(api_id: "mistral-small-4", display_name: "Mistral Small 4", provider: Provider::Mistral,
+            model!(api_id: "mistral-small-2603", display_name: "Mistral Small 4", provider: Provider::Mistral,
                 cost_in: 10.0, cost_out: 30.0, latency_ms: 100, quality: 0.72, context: 128_000,
                 vision: true, open_weight: true, enabled: true),
 
-            model!(api_id: "codestral-2", display_name: "Codestral 2", provider: Provider::Mistral,
+            model!(api_id: "codestral-2508", display_name: "Codestral 2508", provider: Provider::Mistral,
                 cost_in: 30.0, cost_out: 90.0, latency_ms: 110, quality: 0.79, context: 256_000,
                 vision: false, open_weight: false, enabled: true),
 
-            model!(api_id: "ministral-8b", display_name: "Ministral 8B", provider: Provider::Mistral,
+            model!(api_id: "ministral-8b-2512", display_name: "Ministral 8B", provider: Provider::Mistral,
                 cost_in: 10.0, cost_out: 10.0, latency_ms: 60, quality: 0.58, context: 128_000,
                 vision: false, open_weight: true, enabled: true),
 
@@ -869,21 +881,32 @@ impl RouteEngine {
             // META LLAMA — POST https://api.llama.com/v1/chat/completions
             // OpenAI-compatible schema — open-weight
             // ================================================================
-            // SUSPECT api_ids — all three, NOT renamed pending a source.
+            // DEFERRED, and the earlier note here was wrong about why.
             //
-            // These read like OpenRouter slugs with the vendor prefix
-            // stripped ("meta-llama/llama-4-maverick" -> "llama-4-maverick").
-            // Meta's own API appears to key models by the full checkpoint
-            // name instead — e.g. Llama-4-Maverick-17B-128E-Instruct-FP8 —
-            // which would make the bare lowercase form a 404 on the direct
-            // path while working fine for any client on an OpenRouter key.
-            // Exactly the shape of the gemini-3-flash bug.
+            // These ids are NOT mis-slugged. openrouter_prefix(Meta) is
+            // "meta-llama", so resolve_byok_route's formula yields
+            // "meta-llama/llama-4-maverick" — OpenRouter's real, live slug.
+            // For any client on an OpenRouter key these three work today, and
+            // because reachable_providers returns None for an OpenRouter key,
+            // they are auto-selectable for those clients too.
             //
-            // Not renamed because the checkpoint names found so far came from
-            // third-party model catalogs rather than api.llama.com, and the
-            // precision/variant suffix (FP8 vs BF16, 128E) changes which
-            // deployment you get — too consequential to infer. Tracked as its
-            // own task alongside the Mistral block.
+            // The actual problem is bigger than an id: the whole PROVIDER is
+            // gone. Meta wound the Llama API public preview down on
+            // 2026-07-06 -- api.llama.com now returns a sunset response,
+            // llama.developer.meta.com redirects to ai.developer.meta.com,
+            // and that catalog lists only Muse models (muse-spark-1.3 and
+            // siblings), no Llama at all. Meta points developers at
+            // third-party hosts. So provider_base_url(Provider::Meta) in
+            // connectors.rs addresses a service that no longer exists, and
+            // the direct path here is dead no matter what the ids say.
+            //
+            // Deliberately left alone rather than given the kimi-k2.5
+            // treatment: `enabled: false` would also remove the OpenRouter
+            // routes that currently succeed. The real fix is to decide
+            // whether these become Provider::OpenRouter entries with explicit
+            // "meta-llama/..." ids and Provider::Meta retires -- a structural
+            // change touching the Provider enum, reachable_providers, and
+            // ClientProviderKeys, not a rename. Tracked as its own task.
             model!(api_id: "llama-4-maverick", display_name: "Llama 4 Maverick", provider: Provider::Meta,
                 cost_in: 20.0, cost_out: 60.0, latency_ms: 150, quality: 0.83, context: 1_000_000,
                 vision: true, open_weight: true, enabled: true),
@@ -1603,7 +1626,7 @@ mod tests {
     #[test]
     fn simple_code_falls_back_when_no_code_model_is_reachable() {
         let e = RouteEngine::new();
-        // grok-code-fast-1 is xAI and codestral-2 is Mistral — allow neither.
+        // grok-code-fast-1 is xAI and codestral-2508 is Mistral — allow neither.
         let mut only_gemini = HashSet::new();
         only_gemini.insert(Provider::Gemini);
         let shape = RequestShape { task: TaskKind::Code, difficulty: Difficulty::Simple };
@@ -1900,12 +1923,54 @@ mod tests {
     #[test]
     fn simple_code_survives_grok_code_fast_1_being_disabled() {
         // SIMPLE_CODE_MODELS still lists grok-code-fast-1 first; the loop
-        // gates on `enabled`, so this must fall through to codestral-2
+        // gates on `enabled`, so this must fall through to codestral-2508
         // rather than returning a dead model or erroring.
         let e = RouteEngine::new();
         let shape = RequestShape { task: TaskKind::Code, difficulty: Difficulty::Simple };
         let d = e.select_for_shape(shape, 300, 256, None).unwrap();
-        assert_eq!(d.model.api_id, "codestral-2");
+        assert_eq!(d.model.api_id, "codestral-2508");
+    }
+
+    #[test]
+    fn mistral_ids_are_dated_not_bare_product_names() {
+        // Mistral's API keys models by date code; the bare names were
+        // product labels and 404'd on the direct path.
+        let e = RouteEngine::new();
+        let expected = [
+            ("mistral-large-2512", "mistral-large-3"),
+            ("mistral-small-2603", "mistral-small-4"),
+            ("codestral-2508", "codestral-2"),
+            ("ministral-8b-2512", "ministral-8b"),
+        ];
+        for (dated, bare) in expected {
+            let m = e.find(dated).unwrap_or_else(|_| panic!("{dated} missing"));
+            assert_eq!(m.provider, Provider::Mistral, "{dated}");
+            assert!(m.enabled, "{dated}");
+            assert!(e.find(bare).is_err(), "{bare} should no longer resolve");
+        }
+
+        // Dated ids, not "-latest" aliases: every entry carries hand-tuned
+        // figures for one release, which a floating alias would silently
+        // invalidate.
+        for alias in [
+            "mistral-large-latest",
+            "mistral-small-latest",
+            "codestral-latest",
+            "ministral-8b-latest",
+        ] {
+            assert!(e.find(alias).is_err(), "{alias} must not be registered");
+        }
+    }
+
+    #[test]
+    fn simple_code_preference_survives_the_codestral_rename() {
+        // SIMPLE_CODE_MODELS resolves preferred models by literal id, so a
+        // registry rename that misses it silently drops Simple+Code routing
+        // to the score-based fallback instead of erroring.
+        let e = RouteEngine::new();
+        for id in SIMPLE_CODE_MODELS {
+            assert!(e.find(id).is_ok(), "{id} in SIMPLE_CODE_MODELS does not resolve");
+        }
     }
 
     #[test]
