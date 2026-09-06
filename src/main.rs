@@ -23,6 +23,7 @@ mod streaming;
 mod telemetry;
 mod tokens;
 mod vision;
+mod vertex;
 
 use axum::{
     extract::{DefaultBodyLimit, State},
@@ -185,7 +186,10 @@ fn resolve_byok_route(
   if let Some(or_key) = keys.openrouter.as_deref() {
     let prefix = selected_provider.openrouter_prefix();
     let already_prefixed = requested_model.starts_with(&format!("{prefix}/"));
-    let model_id_to_send = if selected_provider == Provider::OpenRouter || already_prefixed {
+    let model_id_to_send = if selected_provider == Provider::OpenRouter
+        || already_prefixed
+        || route_engine.openrouter_catalog_has(requested_model)
+    {
         requested_model.to_string()
     } else if let Some(override_slug) = crate::route_engine::openrouter_slug_override(requested_model) {
         override_slug.to_string()
@@ -242,9 +246,10 @@ fn reachable_providers(keys: &ClientProviderKeys) -> Option<HashSet<Provider>> {
     if keys.qwen.is_some() { set.insert(Provider::Qwen); }
     if keys.moonshot.is_some() { set.insert(Provider::Moonshot); }
     if keys.zhipu.is_some() { set.insert(Provider::Zhipu); }
-    if keys.meta.is_some() { set.insert(Provider::Meta); }
+    if keys.groq.is_some() { set.insert(Provider::Groq); }
     if keys.azure_openai.is_some() { set.insert(Provider::AzureOpenAI); }
     if keys.bedrock.is_some() { set.insert(Provider::Bedrock); }
+    if keys.vertex_ai.is_some() { set.insert(Provider::VertexAI); }
     Some(set)
 }
 
@@ -316,7 +321,7 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
         Ok(p) => p,
         // BYOK-only providers (Azure/Bedrock): billed to the client's own
         // provider account, so RouterFuel has no rates to apply.
-        Err(_) if matches!(selected_provider, Provider::AzureOpenAI | Provider::Bedrock) => (0.0, 0.0),
+        Err(_) if matches!(selected_provider, Provider::AzureOpenAI | Provider::Bedrock | Provider::VertexAI) => (0.0, 0.0),
         Err(e) => {
             error!("Pricing lookup failed: {}", e);
             return ApiError::InternalError("Pricing lookup failed".to_string()).into_response();
@@ -381,7 +386,7 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
         "Starting streaming request"
     );
 
-    streaming::stream_handler(
+    match streaming::stream_handler(
         request_id,
         byok.provider_to_call,
         effective_request.model.clone(),
@@ -392,13 +397,16 @@ async fn handle_streaming(headers: HeaderMap, state: AppState, mut request: Chat
         Arc::clone(&state.route_engine),
         Arc::clone(&state.cost_tracker),
         reqwest::Client::new(),
+        Arc::clone(&state.connector_manager),
         Arc::clone(&state.concurrency_limiter),
         Arc::clone(&state.spend_guard),
         rl_key,
         estimated_cost.total_cost_cents,
     )
-    .await
-    .into_response()
+    .await {
+        Ok(stream) => stream.into_response(),
+        Err(e) => ApiError::ProviderError(e.to_string()).into_response(),
+    }
 }
 
 /// Resolves what to route to. FIX (#4): now takes `keys` and filters
@@ -475,6 +483,7 @@ fn resolve_model(
             &request.model,
             keys.azure_openai.is_some(),
             keys.bedrock.is_some(),
+            keys.vertex_ai.is_some(),
         )
         .map_err(|e| {
             error!("Routing failed: {}", e);
@@ -587,7 +596,7 @@ async fn handle_non_streaming(
             // here never blocks serving the cached response.
             let cache_hit_provider = state
                 .route_engine
-                .select_provider(&cached_response.model, false, false)
+                .select_provider(&cached_response.model, false, false, false)
                 .unwrap_or(Provider::OpenRouter);
 
             state.cost_tracker.record_request(
@@ -663,7 +672,7 @@ async fn handle_non_streaming(
         // BYOK-only providers (Azure/Bedrock) have no registry entry and so no
         // known rates — the client is billed directly by their own Azure/AWS
         // account. Treat as zero-cost rather than failing the request.
-        Err(_) if matches!(selected_provider, Provider::AzureOpenAI | Provider::Bedrock) => (0.0, 0.0),
+        Err(_) if matches!(selected_provider, Provider::AzureOpenAI | Provider::Bedrock | Provider::VertexAI) => (0.0, 0.0),
         Err(e) => {
             error!("Pricing lookup failed: {}", e);
             return Err(ApiError::InternalError("Pricing lookup failed".to_string()));
@@ -979,7 +988,7 @@ fn maybe_fire_shadow_request(
         // accepts any model name when an Azure/Bedrock header is present, so
         // passing it here would turn a typo'd shadow model into a real
         // billable provider call the client never asked for.
-        let shadow_provider = match route_engine.select_provider(&shadow_model_id, false, false) {
+        let shadow_provider = match route_engine.select_provider(&shadow_model_id, false, false, false) {
             Ok(p) => p,
             Err(e) => {
                 debug!(shadow_model = %shadow_model_id, "Shadow mode: unknown model ({e}), skipping");

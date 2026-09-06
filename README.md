@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between your app and the LLM providers you already have keys for — Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Qwen, Moonshot, Zhipu, Meta, Azure OpenAI, AWS Bedrock, and OpenRouter as a universal fallback — and adds the routing, cost tracking, caching, and safety nets you'd otherwise have to build yourself.
+A BYOK (Bring Your Own Key) AI gateway written in Rust. RouterFuel sits between your app and the LLM providers you already have keys for — Anthropic, OpenAI, Gemini, DeepSeek, xAI, Mistral, Qwen, Moonshot, Zhipu, Azure OpenAI, AWS Bedrock, Groq, and OpenRouter as a universal fallback — and adds the routing, cost tracking, caching, and safety nets you'd otherwise have to build yourself.
 
 RouterFuel never holds a billable key of its own. Every request is billed to *your* provider account, using *your* key. RouterFuel's job is just to route it well, cache it when it can, and tell you what it cost.
 
@@ -132,16 +132,19 @@ RouterFuel is pure BYOK — you supply your own keys per provider via request he
 | Qwen           | `X-Qwen-Api-Key`                | Your Alibaba DashScope API key                                               |
 | Moonshot (Kimi)| `X-Moonshot-Api-Key`            | Your Moonshot API key                                                        |
 | Zhipu (GLM)    | `X-Zhipu-Api-Key`               | Your Zhipu API key                                                           |
-| Meta (Llama)   | `X-Meta-Api-Key`                | Your Meta Llama API key                                                      |
+| Groq           | `X-Groq-Api-Key`                | Your Groq API key                                                            |
 | OpenRouter     | `X-OpenRouter-Api-Key`          | `sk-or-...` (standard OpenRouter API key) — acts as universal fallback       |
 | Azure OpenAI   | `X-Azure-OpenAI-Connection`     | `endpoint=https://my-resource.openai.azure.com;key=abc123` or `endpoint=...;identity=managed` |
 | AWS Bedrock    | `X-Bedrock-Connection`          | `region=us-east-1;access_key=AKIA...;secret_key=...`                         |
+| Vertex AI      | `X-Vertex-AI-Connection`        | `project=...;location=...;credentials_base64=...` (or testing-only `api_key=...`) |
 
 **OpenRouter fallback:** If you only supply an `X-OpenRouter-Api-Key` (no direct provider keys), RouterFuel routes *any* model through OpenRouter automatically — you don't need a separate key for each provider.
 
 **Azure OpenAI:** Supply your Azure OpenAI endpoint and either an API key or `identity=managed` for managed identity auth. RouterFuel fetches your available deployments from the Azure Foundry deployments list endpoint at startup, so models appear automatically in the registry. That list isn't a restriction, though: whenever the connection header is present, *any* model name is accepted and routed straight to your Azure deployment — no name prefix and no pre-registration required, since the header itself is proof you can pay for the call.
 
 **AWS Bedrock:** Supply your AWS region and IAM credentials (access key + secret key). RouterFuel fetches available foundation models from the Bedrock `ListFoundationModels` API at startup. In production, proper AWS SigV4 signing is used; for testing, credentials can be passed as headers. As with Azure, that list isn't a restriction — with the connection header present, *any* model name is accepted and routed to Bedrock, with no prefix or pre-registration needed.
+
+**Vertex AI:** Supply the Google Cloud project, location, and base64-encoded service-account JSON. RouterFuel exchanges the service-account assertion for a short-lived OAuth token, caches it in memory, refreshes it five minutes before expiry, and retries once after a 401. API-key auth is available only for testing. Any publisher model id can be routed through the project/location-scoped connection.
 
 ## Project structure
 

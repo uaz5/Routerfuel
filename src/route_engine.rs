@@ -877,45 +877,36 @@ impl RouteEngine {
                 cost_in: 57.0, cost_out: 258.0, latency_ms: 180, quality: 0.86, context: 200_000,
                 vision: false, open_weight: true, enabled: true),
 
+            // GROQ — official production chat ids checked 2026-09-06.
+            model!(api_id: "llama-3.1-8b-instant", display_name: "Llama 3.1 8B Instant (Groq)", provider: Provider::Groq,
+                cost_in: 5.0, cost_out: 8.0, latency_ms: 40, quality: 0.68, context: 131_072,
+                vision: false, open_weight: true, enabled: true),
+            model!(api_id: "llama-3.3-70b-versatile", display_name: "Llama 3.3 70B Versatile (Groq)", provider: Provider::Groq,
+                cost_in: 59.0, cost_out: 79.0, latency_ms: 70, quality: 0.79, context: 131_072,
+                vision: false, open_weight: true, enabled: true),
+            model!(api_id: "openai/gpt-oss-120b", display_name: "GPT-OSS 120B (Groq)", provider: Provider::Groq,
+                cost_in: 15.0, cost_out: 60.0, latency_ms: 55, quality: 0.82, context: 131_072,
+                vision: false, open_weight: true, enabled: true),
+            model!(api_id: "openai/gpt-oss-20b", display_name: "GPT-OSS 20B (Groq)", provider: Provider::Groq,
+                cost_in: 7.5, cost_out: 30.0, latency_ms: 35, quality: 0.73, context: 131_072,
+                vision: false, open_weight: true, enabled: true),
+
             // ================================================================
-            // META LLAMA — POST https://api.llama.com/v1/chat/completions
-            // OpenAI-compatible schema — open-weight
+            // META LLAMA via OpenRouter — explicit live catalog slugs.
             // ================================================================
-            // DEFERRED, and the earlier note here was wrong about why.
+            // Meta's direct Llama API public preview shut down on 2026-07-06.
             //
-            // These ids are NOT mis-slugged. openrouter_prefix(Meta) is
-            // "meta-llama", so resolve_byok_route's formula yields
-            // "meta-llama/llama-4-maverick" — OpenRouter's real, live slug.
-            // For any client on an OpenRouter key these three work today, and
-            // because reachable_providers returns None for an OpenRouter key,
-            // they are auto-selectable for those clients too.
-            //
-            // The actual problem is bigger than an id: the whole PROVIDER is
-            // gone. Meta wound the Llama API public preview down on
-            // 2026-07-06 -- api.llama.com now returns a sunset response,
-            // llama.developer.meta.com redirects to ai.developer.meta.com,
-            // and that catalog lists only Muse models (muse-spark-1.3 and
-            // siblings), no Llama at all. Meta points developers at
-            // third-party hosts. So provider_base_url(Provider::Meta) in
-            // connectors.rs addresses a service that no longer exists, and
-            // the direct path here is dead no matter what the ids say.
-            //
-            // Deliberately left alone rather than given the kimi-k2.5
-            // treatment: `enabled: false` would also remove the OpenRouter
-            // routes that currently succeed. The real fix is to decide
-            // whether these become Provider::OpenRouter entries with explicit
-            // "meta-llama/..." ids and Provider::Meta retires -- a structural
-            // change touching the Provider enum, reachable_providers, and
-            // ClientProviderKeys, not a rename. Tracked as its own task.
-            model!(api_id: "llama-4-maverick", display_name: "Llama 4 Maverick", provider: Provider::Meta,
+            // These entries now route only through OpenRouter; Provider::Meta
+            // and the dead api.llama.com connector have been retired.
+            model!(api_id: "meta-llama/llama-4-maverick", display_name: "Llama 4 Maverick", provider: Provider::OpenRouter,
                 cost_in: 20.0, cost_out: 60.0, latency_ms: 150, quality: 0.83, context: 1_000_000,
                 vision: true, open_weight: true, enabled: true),
 
-            model!(api_id: "llama-4-scout", display_name: "Llama 4 Scout", provider: Provider::Meta,
+            model!(api_id: "meta-llama/llama-4-scout", display_name: "Llama 4 Scout", provider: Provider::OpenRouter,
                 cost_in: 8.0, cost_out: 30.0, latency_ms: 120, quality: 0.75, context: 10_000_000,
                 vision: true, open_weight: true, enabled: true),
 
-            model!(api_id: "llama-3.3-70b", display_name: "Llama 3.3 70B (legacy)", provider: Provider::Meta,
+            model!(api_id: "meta-llama/llama-3.3-70b-instruct", display_name: "Llama 3.3 70B (legacy)", provider: Provider::OpenRouter,
                 cost_in: 12.0, cost_out: 40.0, latency_ms: 130, quality: 0.70, context: 128_000,
                 vision: false, open_weight: true, enabled: true),
 
@@ -1202,12 +1193,16 @@ impl RouteEngine {
         _model_name: &str,
         has_azure_header: bool,
         has_bedrock_header: bool,
+        has_vertex_header: bool,
     ) -> Option<Provider> {
         if has_azure_header {
             return Some(Provider::AzureOpenAI);
         }
         if has_bedrock_header {
             return Some(Provider::Bedrock);
+        }
+        if has_vertex_header {
+            return Some(Provider::VertexAI);
         }
         None
     }
@@ -1221,15 +1216,16 @@ impl RouteEngine {
         model_name: &str,
         has_azure_header: bool,
         has_bedrock_header: bool,
+        has_vertex_header: bool,
     ) -> Result<Provider> {
-        // First try the static registry.
-        if let Ok(m) = self.find(model_name) {
-            return Ok(m.provider);
+        // A connection-style provider is an explicit routing instruction and
+        // must win even when its model id also exists in the static registry.
+        if let Some(provider) = self.resolve_byok_provider(model_name, has_azure_header, has_bedrock_header, has_vertex_header) {
+            return Ok(provider);
         }
 
-        // Fall back to BYOK-only providers.
-        if let Some(provider) = self.resolve_byok_provider(model_name, has_azure_header, has_bedrock_header) {
-            return Ok(provider);
+        if let Ok(m) = self.find(model_name) {
+            return Ok(m.provider);
         }
 
         Err(anyhow!(
@@ -1353,6 +1349,8 @@ pub fn openrouter_slug_override(direct_api_id: &str) -> Option<&'static str> {
         // carries the dot, so the formula yields the correct
         // "x-ai/grok-4.6".
         "claude-fable-5-1" => Some("anthropic/claude-fable-5.1"),
+        "llama-3.1-8b-instant" => Some("meta-llama/llama-3.1-8b-instruct"),
+        "llama-3.3-70b-versatile" => Some("meta-llama/llama-3.3-70b-instruct"),
         // gemini-3.1-pro-preview needs no entry: like the flash rename, the
         // formula now yields "google/gemini-3.1-pro-preview" directly.
         _ => None,
@@ -1510,7 +1508,7 @@ mod tests {
         for provider in [
             Provider::Anthropic, Provider::OpenAI, Provider::Gemini, Provider::DeepSeek,
             Provider::Mistral, Provider::XAI, Provider::Qwen, Provider::Moonshot,
-            Provider::Zhipu, Provider::Meta, Provider::OpenRouter,
+            Provider::Zhipu, Provider::Groq, Provider::OpenRouter,
         ] {
             assert!(
                 models.iter().any(|m| m.provider == provider),
@@ -1559,27 +1557,43 @@ mod tests {
     #[test]
     fn byok_azure_provider_resolved_with_header() {
         let e = RouteEngine::new();
-        let provider = e.select_provider("any-model-name", true, false).unwrap();
+        let provider = e.select_provider("any-model-name", true, false, false).unwrap();
         assert_eq!(provider, Provider::AzureOpenAI);
     }
 
     #[test]
     fn byok_bedrock_provider_resolved_with_header() {
         let e = RouteEngine::new();
-        let provider = e.select_provider("any-model-name", false, true).unwrap();
+        let provider = e.select_provider("any-model-name", false, true, false).unwrap();
         assert_eq!(provider, Provider::Bedrock);
+    }
+
+    #[test]
+    fn byok_vertex_provider_resolved_with_header() {
+        let e = RouteEngine::new();
+        let provider = e.select_provider("gemini-custom", false, false, true).unwrap();
+        assert_eq!(provider, Provider::VertexAI);
+    }
+
+    #[test]
+    fn groq_and_meta_openrouter_ids_are_explicit() {
+        let e = RouteEngine::new();
+        assert_eq!(e.find("openai/gpt-oss-120b").unwrap().provider, Provider::Groq);
+        assert_eq!(e.find("meta-llama/llama-4-maverick").unwrap().provider, Provider::OpenRouter);
+        assert_eq!(e.find("meta-llama/llama-3.3-70b-instruct").unwrap().provider, Provider::OpenRouter);
+        assert!(e.find("llama-3.3-70b").is_err());
     }
 
     #[test]
     fn byok_azure_rejected_without_header() {
         let e = RouteEngine::new();
-        assert!(e.select_provider("any-model-name", false, false).is_err());
+        assert!(e.select_provider("any-model-name", false, false, false).is_err());
     }
 
     #[test]
     fn byok_bedrock_rejected_without_header() {
         let e = RouteEngine::new();
-        assert!(e.select_provider("any-model-name", false, false).is_err());
+        assert!(e.select_provider("any-model-name", false, false, false).is_err());
     }
 
     #[test]
@@ -1898,7 +1912,7 @@ mod tests {
         assert!(m.supports_vision);
         assert_eq!(e.get_pricing("gpt-6-astra").unwrap(), (1000.0, 5000.0));
         assert_eq!(
-            e.select_provider("gpt-6-astra", false, false).unwrap(),
+            e.select_provider("gpt-6-astra", false, false, false).unwrap(),
             Provider::OpenAI
         );
 

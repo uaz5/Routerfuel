@@ -58,7 +58,8 @@ pub struct ClientProviderKeys {
     pub qwen: Option<String>,
     pub moonshot: Option<String>,
     pub zhipu: Option<String>,
-    pub meta: Option<String>,
+    pub groq: Option<String>,
+    pub vertex_ai: Option<String>,
     /// OpenRouter acts as a universal fallback: if a client supplies only
     /// this key, RouterFuel routes *any* model through OpenRouter instead of
     /// requiring a separate key per lab — see main.rs `resolve_byok_route`.
@@ -86,8 +87,8 @@ impl ClientProviderKeys {
                 .or_else(|| extract_header_string(headers, "x-kimi-api-key")),
             zhipu: extract_header_string(headers, "x-zhipu-api-key")
                 .or_else(|| extract_header_string(headers, "x-glm-api-key")),
-            meta: extract_header_string(headers, "x-meta-api-key")
-                .or_else(|| extract_header_string(headers, "x-llama-api-key")),
+            groq: extract_header_string(headers, "x-groq-api-key"),
+            vertex_ai: extract_header_string(headers, "x-vertex-ai-connection"),
             openrouter: extract_header_string(headers, "x-openrouter-api-key"),
             azure_openai: extract_header_string(headers, "x-azure-openai-connection"),
             bedrock: extract_header_string(headers, "x-bedrock-connection"),
@@ -107,7 +108,8 @@ impl ClientProviderKeys {
             Provider::Qwen       => self.qwen.as_deref(),
             Provider::Moonshot   => self.moonshot.as_deref(),
             Provider::Zhipu      => self.zhipu.as_deref(),
-            Provider::Meta       => self.meta.as_deref(),
+            Provider::Groq       => self.groq.as_deref(),
+            Provider::VertexAI   => self.vertex_ai.as_deref(),
             Provider::OpenRouter => self.openrouter.as_deref(),
             Provider::AzureOpenAI => self.azure_openai.as_deref(),
             Provider::Bedrock    => self.bedrock.as_deref(),
@@ -126,7 +128,8 @@ impl ClientProviderKeys {
             || self.qwen.is_some()
             || self.moonshot.is_some()
             || self.zhipu.is_some()
-            || self.meta.is_some()
+            || self.groq.is_some()
+            || self.vertex_ai.is_some()
             || self.openrouter.is_some()
             || self.azure_openai.is_some()
             || self.bedrock.is_some()

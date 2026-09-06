@@ -14,7 +14,7 @@
 // =============================================================================
 
 use crate::concurrency::ConcurrencyLimiter;
-use crate::connectors::{provider_base_url, to_gemini_body, ChatCompletionRequest, Provider};
+use crate::connectors::{provider_base_url, to_gemini_body, ChatCompletionRequest, ConnectorError, ConnectorManager, Provider};
 use crate::cost_tracker::CostTracker;
 use crate::guardrails::SpendGuard;
 use crate::route_engine::{OutputTokenField, RouteEngine};
@@ -102,7 +102,7 @@ struct GeminiStreamUsage {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(route_engine, cost_tracker, http_client, req, api_key, concurrency_limiter, spend_guard))]
+#[instrument(skip(route_engine, cost_tracker, http_client, connector_manager, req, api_key, concurrency_limiter, spend_guard))]
 pub async fn stream_handler(
     request_id: String,
     provider: Provider,
@@ -114,13 +114,14 @@ pub async fn stream_handler(
     route_engine: Arc<RouteEngine>,
     cost_tracker: Arc<CostTracker>,
     http_client: reqwest::Client,
+    connector_manager: Arc<ConnectorManager>,
     concurrency_limiter: Arc<ConcurrencyLimiter>,
     // FIX: new params — spend_guard + the reservation key/amount main.rs
     // already reserved before calling this function.
     spend_guard: Arc<SpendGuard>,
     rl_key: String,
     estimated_cost_cents: f64,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ConnectorError> {
     let start = Instant::now();
 
     let (audit_tx, mut audit_rx) = mpsc::channel::<AuditPayload>(1);
@@ -197,6 +198,10 @@ pub async fn stream_handler(
         }
     });
 
+    let vertex_parts = if provider == Provider::VertexAI {
+        Some(connector_manager.vertex_stream_parts(&api_key, &req.model).await?)
+    } else { None };
+
     let (url, body): (String, serde_json::Value) = match provider {
         Provider::Anthropic => {
             let mut body = serde_json::json!({
@@ -223,6 +228,10 @@ pub async fn stream_handler(
                 req.model
             );
             (url, body)
+        }
+        Provider::VertexAI => {
+            let url = vertex_parts.as_ref().map(|p| p.0.clone()).unwrap_or_default();
+            (url, to_gemini_body(&req))
         }
         Provider::AzureOpenAI => {
             // Azure OpenAI streaming uses the same OpenAI-compatible format
@@ -259,7 +268,7 @@ pub async fn stream_handler(
             body["stream"] = serde_json::Value::Bool(true);
             (url, body)
         }
-        // OpenAI, DeepSeek, Mistral, xAI, Qwen, Moonshot, Zhipu, Meta,
+        // OpenAI, DeepSeek, Mistral, xAI, Qwen, Moonshot, Zhipu,
         // OpenRouter — everything OpenAI-compatible.
         //
         // Note this serialises ChatCompletionRequest directly instead of
@@ -308,8 +317,18 @@ pub async fn stream_handler(
     let is_anthropic = matches!(provider, Provider::Anthropic);
     let is_azure = matches!(provider, Provider::AzureOpenAI);
     let is_bedrock = matches!(provider, Provider::Bedrock);
+    let is_vertex = matches!(provider, Provider::VertexAI);
 
-    let http_req = if is_gemini {
+    let http_req = if is_vertex {
+        let mut request = http_client.post(&url).header("content-type", "application/json");
+        if let Some((_, auth)) = vertex_parts.as_ref() {
+            request = match auth {
+                crate::vertex::VertexAuth::Bearer(token) => request.bearer_auth(token),
+                crate::vertex::VertexAuth::ApiKey(key) => request.header("x-goog-api-key", key),
+            };
+        }
+        request.json(&body)
+    } else if is_gemini {
         http_client
             .post(&url)
             .header("x-goog-api-key", &api_key)
@@ -443,7 +462,7 @@ pub async fn stream_handler(
                         }
                     }
                     yield Event::default().data(data);
-                } else if is_gemini {
+                } else if is_gemini || is_vertex {
                     if let Ok(chunk) = serde_json::from_str::<GeminiStreamChunk>(data) {
                         if let Some(candidates) = &chunk.candidates {
                             for c in candidates {
@@ -514,11 +533,11 @@ pub async fn stream_handler(
         }).await;
     };
 
-    Sse::new(stream).keep_alive(
+    Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
-    )
+    ))
 }
 
 #[derive(Debug)]

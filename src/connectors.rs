@@ -56,7 +56,8 @@ pub enum Provider {
     Qwen,      // Alibaba DashScope (OpenAI-compatible mode)
     Moonshot,  // Kimi
     Zhipu,     // GLM
-    Meta,      // Llama API
+    Groq,
+    VertexAI,
     OpenRouter,
     AzureOpenAI,
     Bedrock,
@@ -74,7 +75,8 @@ impl std::fmt::Display for Provider {
             Provider::Qwen        => write!(f, "qwen"),
             Provider::Moonshot    => write!(f, "moonshot"),
             Provider::Zhipu       => write!(f, "zhipu"),
-            Provider::Meta        => write!(f, "meta"),
+            Provider::Groq        => write!(f, "groq"),
+            Provider::VertexAI    => write!(f, "vertex_ai"),
             Provider::OpenRouter  => write!(f, "openrouter"),
             Provider::AzureOpenAI => write!(f, "azure_openai"),
             Provider::Bedrock     => write!(f, "bedrock"),
@@ -98,7 +100,8 @@ impl Provider {
             Provider::Qwen      => "qwen",
             Provider::Moonshot  => "moonshotai",
             Provider::Zhipu     => "z-ai",
-            Provider::Meta      => "meta-llama",
+            Provider::Groq      => "groq",
+            Provider::VertexAI  => "google",
             Provider::OpenRouter => "",
             Provider::AzureOpenAI => "",
             Provider::Bedrock => "",
@@ -322,7 +325,8 @@ pub fn provider_base_url(provider: Provider) -> &'static str {
         Provider::Qwen       => "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
         Provider::Moonshot   => "https://api.moonshot.ai/v1/chat/completions",
         Provider::Zhipu      => "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        Provider::Meta       => "https://api.llama.com/v1/chat/completions",
+        Provider::Groq       => "https://api.groq.com/openai/v1/chat/completions",
+        Provider::VertexAI   => "",
         Provider::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
         Provider::AzureOpenAI => "", // set dynamically per deployment
         Provider::Bedrock => "", // set dynamically per model
@@ -924,7 +928,8 @@ pub struct ConnectorManager {
     qwen:       GenericOpenAICompatibleConnector,
     moonshot:   GenericOpenAICompatibleConnector,
     zhipu:      GenericOpenAICompatibleConnector,
-    meta:       GenericOpenAICompatibleConnector,
+    groq:       GenericOpenAICompatibleConnector,
+    vertex_ai:  crate::vertex::VertexConnector,
     openrouter: GenericOpenAICompatibleConnector,
     azure_openai: AzureOpenAIConnector,
     bedrock:    BedrockConnector,
@@ -935,6 +940,7 @@ impl ConnectorManager {
         let cb_openrouter = Arc::clone(&cb);
         let cb_azure = Arc::clone(&cb);
         let cb_bedrock = Arc::clone(&cb);
+        let cb_vertex = Arc::clone(&cb);
 
         Self {
             openai: GenericOpenAICompatibleConnector::new(
@@ -974,11 +980,12 @@ impl ConnectorManager {
                 provider_base_url(Provider::Zhipu),
                 Arc::clone(&cb),
             ),
-            meta: GenericOpenAICompatibleConnector::new(
-                Provider::Meta,
-                provider_base_url(Provider::Meta),
+            groq: GenericOpenAICompatibleConnector::new(
+                Provider::Groq,
+                provider_base_url(Provider::Groq),
                 Arc::clone(&cb),
             ),
+            vertex_ai: crate::vertex::VertexConnector::new(cb_vertex),
             openrouter: GenericOpenAICompatibleConnector::new(
                 Provider::OpenRouter,
                 provider_base_url(Provider::OpenRouter),
@@ -1009,11 +1016,23 @@ impl ConnectorManager {
             Provider::Qwen       => self.qwen.complete(req, client_api_key).await,
             Provider::Moonshot   => self.moonshot.complete(req, client_api_key).await,
             Provider::Zhipu      => self.zhipu.complete(req, client_api_key).await,
-            Provider::Meta       => self.meta.complete(req, client_api_key).await,
+            Provider::Groq       => self.groq.complete(req, client_api_key).await,
+            Provider::VertexAI   => self.vertex_ai.complete(req, client_api_key).await,
             Provider::OpenRouter => self.openrouter.complete(req, client_api_key).await,
             Provider::AzureOpenAI => self.azure_openai.complete(req, client_api_key).await,
             Provider::Bedrock    => self.bedrock.complete(req, client_api_key).await,
         }
+    }
+
+    pub async fn vertex_stream_parts(
+        &self,
+        connection_string: &str,
+        model: &str,
+    ) -> Result<(String, crate::vertex::VertexAuth), ConnectorError> {
+        let connection = crate::vertex::VertexConnector::parse_connection(connection_string)?;
+        let url = crate::vertex::VertexConnector::url(&connection, model, true)?;
+        let auth = self.vertex_ai.auth(&connection, false).await?;
+        Ok((url, auth))
     }
 }
 
