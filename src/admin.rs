@@ -348,9 +348,39 @@ pub async fn cache_stats_handler(State(state): State<AdminState>) -> impl IntoRe
     .fetch_one(state.pool.as_ref())
     .await;
  
+    // Both casts exist to match what the Rust side reads, and both were
+    // real panics rather than tidiness — sqlx's Row::get panics on a type
+    // mismatch, and a panic inside an axum handler drops the connection
+    // with no response at all, so /admin/cache returned nothing (curl
+    // reports http 000) rather than a 500 anyone would notice in a status
+    // count. The dashboard's cache panel is fed from here.
+    //
+    //   hit_count::bigint     — the column is INTEGER (i32), but
+    //                           TopCachedEntry.hit_count is i64 and the
+    //                           mapping below reads get::<i64, _>. This
+    //                           panicked on EVERY row, so the endpoint
+    //                           broke the moment anything was ever cached.
+    //
+    //   COALESCE(prompt_preview, '')
+    //                         — the column is VARCHAR(200) NULLABLE
+    //                           (002_semantic_cache_and_vision.sql) but is
+    //                           read into a plain String. Not yet observed,
+    //                           because no stored row has had a NULL
+    //                           preview, but it is the same panic waiting
+    //                           on one that does.
+    //
+    // Cast in SQL rather than widening/Optioning the Rust types: it keeps
+    // the fix inside the statement that has the problem and leaves
+    // TopCachedEntry, and therefore the JSON the dashboard consumes,
+    // unchanged.
+    //
+    // model_used needs nothing — VARCHAR NOT NULL, read as String.
     let top_rows = sqlx::query(
         r#"
-        SELECT prompt_preview, model_used, hit_count
+        SELECT
+            COALESCE(prompt_preview, '') AS prompt_preview,
+            model_used,
+            hit_count::bigint            AS hit_count
         FROM semantic_cache
         ORDER BY hit_count DESC
         LIMIT 10

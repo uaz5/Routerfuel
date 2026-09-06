@@ -39,7 +39,7 @@ services:
       retries: 10
 
   app:
-    image: nayilumair/routerfuel:0.6.2
+    image: nayilumair/routerfuel:0.6.3
     restart: unless-stopped
     depends_on:
       db:

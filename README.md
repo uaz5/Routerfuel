@@ -42,7 +42,7 @@ docker compose up
 
 This starts Postgres with `pgvector` pre-installed and runs migrations automatically on first boot — no manual database setup. RouterFuel listens on `http://localhost:3000`.
 
-No `--build` needed: the `app` service pulls a prebuilt image (`nayilumair/routerfuel:0.6.2`), so first run takes seconds instead of the 10-15 minutes a from-scratch Rust compile costs.
+No `--build` needed: the `app` service pulls a prebuilt image (`nayilumair/routerfuel:0.6.3`), so first run takes seconds instead of the 10-15 minutes a from-scratch Rust compile costs.
 
 Semantic caching (local ONNX embeddings) is on out of the box — the model and tokenizer are committed to this repo under `./models/`, and compose mounts them into the container, so there's nothing to download or convert. If those files are missing or unreadable the gateway still runs normally with semantic caching disabled; look for `Local ONNX embedding model loaded — semantic cache active` in the startup log to confirm it's active. Note the models are mounted by compose rather than baked into the image, so running the image on its own leaves caching off.
 
